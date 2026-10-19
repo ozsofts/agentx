@@ -47,6 +47,7 @@ import MermaidPreview from "./MermaidPreview.jsx";
 import useThreadScroll from "./useThreadScroll.js";
 import Modal from "./Modal.jsx";
 import CollapsedProjectSessions from "./CollapsedProjectSessions.jsx";
+import QueuedInputs from "./QueuedInputs.jsx";
 
 const desktopMode = Boolean(window.piDesktop);
 
@@ -120,14 +121,17 @@ function ActivityRow({ activity }) {
   };
 
   if (activity.kind === "reasoning") {
+    const thinking = activity.status === "running";
+    const expanded = thinking || open;
     return (
-      <div className="reasoning-step">
-        <div className="reasoning-step-heading">
-          {activity.status === "running" ? <CircleNotch size={15} weight="bold" className="spin" /> : <Cpu size={15} />}
+      <div className={`reasoning-step ${expanded ? "is-open" : ""}`}>
+        <button type="button" className="reasoning-step-heading" aria-expanded={expanded} aria-disabled={thinking} onClick={() => { if (!thinking) setOpen((value) => !value); }}>
+          {thinking ? <CircleNotch size={15} weight="bold" className="spin" /> : <Cpu size={15} />}
           <span>{activity.title || "思考过程"}</span>
           <span className="activity-meta">{activity.meta}</span>
-        </div>
-        {output && <div className="reasoning-output"><MarkdownContent>{output}</MarkdownContent></div>}
+          <CaretRight size={14} className="activity-caret" />
+        </button>
+        {expanded && activity.output && <div className="reasoning-output"><MarkdownContent>{activity.output}</MarkdownContent></div>}
       </div>
     );
   }
@@ -194,6 +198,7 @@ function AttachmentList({ attachments = [], onRemove, pending = false }) {
 
 function ProcessGroup({ message }) {
   const running = message.status === "running" || message.activities.some((activity) => activity.status === "running");
+  const thinking = message.activities.some((activity) => activity.kind === "reasoning" && activity.status === "running");
   const failed = message.status === "error" || message.activities.some((activity) => activity.status === "error");
   const [open, setOpen] = useState(running);
   const wasRunning = useRef(running);
@@ -203,6 +208,7 @@ function ProcessGroup({ message }) {
     else if (wasRunning.current) setOpen(false);
     wasRunning.current = running;
   }, [running]);
+  useEffect(() => { if (thinking) setOpen(true); }, [thinking]);
 
   const elapsed = formatElapsed(message.durationMs ?? (
     Number.isFinite(message.startedAt) && Number.isFinite(message.completedAt)
@@ -213,13 +219,13 @@ function ProcessGroup({ message }) {
 
   return (
     <div className={`process-group ${open ? "is-open" : ""}`}>
-      <button type="button" className="process-summary" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+      <button type="button" className="process-summary" onClick={() => { if (!thinking) setOpen((value) => !value); }} aria-expanded={open || thinking} aria-disabled={thinking}>
         {running && <CircleNotch size={15} weight="bold" className="spin" />}
         {!running && failed && <WarningCircle size={15} weight="fill" />}
         <span>{label}</span>
         <CaretRight size={15} className="process-caret" />
       </button>
-      {open && (
+      {(open || thinking) && (
         <div className="process-body">
           {message.activities.map((activity) => <ActivityRow key={activity.id} activity={activity} />)}
         </div>
@@ -1472,6 +1478,21 @@ export function App() {
   const [attachmentError, setAttachmentError] = useState("");
   const [attachmentPickerBusy, setAttachmentPickerBusy] = useState(false);
   const [runningSessions, setRunningSessions] = useState({});
+  const [inputQueues, setInputQueues] = useState({});
+  const [sendingInput, setSendingInput] = useState(false);
+  const submittingInput = useRef(false);
+  const draftCache = useRef(new Map());
+  const draftSession = useRef(activeTaskId);
+  useEffect(() => {
+    if (draftSession.current !== activeTaskId) {
+      const draft = draftCache.current.get(activeTaskId);
+      setInput(draft?.text || "");
+      setAttachments(draft?.attachments || []);
+      setAttachmentError("");
+      draftSession.current = activeTaskId;
+    }
+  }, [activeTaskId]);
+  useEffect(() => { draftCache.current.set(activeTaskId, { text: input, attachments }); }, [activeTaskId, input, attachments]);
   const running = Boolean(runningSessions[activeTaskId]);
   const activeSessionRef = useRef(activeTaskId);
   activeSessionRef.current = activeTaskId;
@@ -1517,11 +1538,6 @@ export function App() {
   const supportsImages = !desktopMode || model?.input?.includes("image");
   const hasUnsupportedImage = attachments.some((attachment) => attachment.kind === "image") && !supportsImages;
 
-  useEffect(() => {
-    setAttachments([]);
-    setAttachmentError("");
-  }, [activeTaskId]);
-
   useEffect(() => { panelOpenCache.current.set(activeTaskId, reviewOpen); }, [activeTaskId, reviewOpen]);
 
   useEffect(() => {
@@ -1554,9 +1570,9 @@ export function App() {
         setSessions((current) => ({ ...current, [event.sessionId]: event.running && current[event.sessionId] ? current[event.sessionId] : event.messages || [] }));
         setActiveTaskId(event.sessionId);
         setRunningSessions((current) => ({ ...current, [event.sessionId]: Boolean(event.running) }));
+        setInputQueues((current) => ({ ...current, [event.sessionId]: event.pendingInputs || [] }));
         setPermission(({ "read-only": "只读", ask: "执行前询问", full: "完全访问" })[event.permissionMode] || "执行前询问");
         setApproval(event.pendingApprovals?.[0] || pendingApprovals.current.get(event.sessionId) || null);
-        setInput("");
         setPreviewRequest(null);
         setReviewOpen(panelOpenCache.current.get(event.sessionId) ?? false);
         setAvailableModels(event.availableModels || []);
@@ -1567,6 +1583,13 @@ export function App() {
         transport.listProjects?.().then((items) => setProjects(items || [])).catch(() => {});
       }
       if (event.type === "projects.updated") setProjects(event.projects || []);
+      if (event.type === "queue.updated") setInputQueues((current) => ({ ...current, [event.sessionId]: event.entries || [] }));
+      if (event.type === "input.consumed") {
+        setSessions((current) => ({ ...current, [event.sessionId]: [
+          ...(current[event.sessionId] || []).filter((message) => message.id !== `user-${event.input.id}`),
+          { id: `user-${event.input.id}`, role: "user", text: event.input.text, attachments: event.input.attachments },
+        ] }));
+      }
       const isCurrent = !event.sessionId || event.sessionId === activeSessionRef.current;
       if (event.type === "runtime.status") {
         if (isCurrent) setRuntime({ connected: event.connected, authenticated: event.authenticated, message: event.message });
@@ -1675,11 +1698,12 @@ export function App() {
           return { ...current, [event.sessionId]: list };
         });
       }
-      if (event.type === "run.settled") {
-        setRunningSessions((current) => ({ ...current, [event.sessionId]: false }));
+      if (event.type === "run.settled" || event.type === "run.segment.settled") {
+        const settled = event.type === "run.settled";
+        if (settled) setRunningSessions((current) => ({ ...current, [event.sessionId]: false }));
         pendingApprovals.current.delete(event.sessionId);
         if (isCurrent) setApproval(null);
-        setTasks((current) => current.map((task) => task.id === event.sessionId ? { ...task, status: event.status === "error" ? "error" : "done", time: "刚刚" } : task));
+        if (settled) setTasks((current) => current.map((task) => task.id === event.sessionId ? { ...task, status: event.status === "error" ? "error" : "done", time: "刚刚" } : task));
         setSessions((current) => ({
           ...current,
           [event.sessionId]: (current[event.sessionId] || []).map((message) => message.runId === event.runId ? {
@@ -1930,7 +1954,7 @@ export function App() {
   };
 
   const chooseAttachments = async () => {
-    if (running || attachmentPickerBusy || attachments.length >= 8) return;
+    if (attachmentPickerBusy || attachments.length >= 8) return;
     setAttachmentPickerBusy(true);
     setAttachmentError("");
     try {
@@ -1966,7 +1990,7 @@ export function App() {
 
   const submit = async () => {
     const text = input.trim();
-    if ((!text && attachments.length === 0) || running) return;
+    if ((!text && attachments.length === 0) || submittingInput.current) return;
     if (hasUnsupportedImage) {
       setAttachmentError("当前模型不支持图片输入，请移除图片或切换模型。");
       return;
@@ -1977,11 +2001,30 @@ export function App() {
     }
     const submittedAttachments = attachments;
     const displayText = text || "请阅读并处理所附文件。";
+    const submittedSessionId = activeTaskId;
+    const wasRunning = running;
+    submittingInput.current = true;
+    setSendingInput(true);
+    if (wasRunning) {
+      try {
+        await transportRef.current.queueInput({ sessionId: submittedSessionId, inputId: crypto.randomUUID(), text: displayText, attachments: submittedAttachments, behavior: "followUp" });
+        const draft = draftCache.current.get(submittedSessionId);
+        if (draft) draftCache.current.set(submittedSessionId, { text: draft.text === input ? "" : draft.text, attachments: draft.attachments === submittedAttachments ? [] : draft.attachments });
+        if (activeSessionRef.current === submittedSessionId) {
+          setInput((current) => current === input ? "" : current);
+          setAttachments((current) => current === submittedAttachments ? [] : current);
+          setAttachmentError("");
+        }
+      } catch (error) {
+        if (activeSessionRef.current === submittedSessionId) setAttachmentError(error.message || "消息未加入队列，请重试");
+      } finally { submittingInput.current = false; setSendingInput(false); }
+      return;
+    }
     threadScroll.jumpToBottom();
     setInput("");
     setAttachments([]);
     setAttachmentError("");
-    const submittedSessionId = activeTaskId;
+    draftCache.current.set(submittedSessionId, { text: "", attachments: [] });
     setRunningSessions((current) => ({ ...current, [submittedSessionId]: true }));
     setRuntimeError("");
     setSessions((current) => ({
@@ -1991,6 +2034,10 @@ export function App() {
     if (activeTask.title === "未命名会话") {
       setTasks((current) => current.map((task) => task.id === activeTaskId ? { ...task, title: displayText.slice(0, 24), repo: "pi-desktop" } : task));
     }
+    // prompt() resolves after the whole run; release only the submission lock
+    // now so another input can be queued while this request is streaming.
+    submittingInput.current = false;
+    setSendingInput(false);
     try {
       await transportRef.current?.prompt({ sessionId: activeTaskId, text: displayText, attachments: submittedAttachments });
       const nextProjects = await transportRef.current?.listProjects?.();
@@ -1998,11 +2045,39 @@ export function App() {
     } catch (error) {
       setRunningSessions((current) => ({ ...current, [submittedSessionId]: false }));
       if (activeSessionRef.current === submittedSessionId) {
-        setInput(text);
-        setAttachments(submittedAttachments);
+        setInput((current) => current || text);
+        setAttachments((current) => current.length ? current : submittedAttachments);
         setRuntimeError(error.message || "任务执行失败");
       }
     }
+  };
+
+  const resumeQueuedInput = async (entry) => {
+    if (running || submittingInput.current) return;
+    const sessionId = activeTaskId;
+    setRunningSessions((current) => ({ ...current, [sessionId]: true }));
+    try { await transportRef.current.prompt({ sessionId, queuedInputId: entry.id }); }
+    catch (error) {
+      setRunningSessions((current) => ({ ...current, [sessionId]: false }));
+      if (activeSessionRef.current === sessionId) setRuntimeError(error.message || "无法继续发送");
+    }
+  };
+
+  const removeQueuedInput = async (entry, edit = false) => {
+    const sessionId = activeTaskId;
+    try {
+      await transportRef.current.removeQueuedInput(sessionId, entry.id);
+      if (edit) {
+        draftCache.current.set(sessionId, { text: entry.text, attachments: entry.attachments || [] });
+        if (activeSessionRef.current === sessionId) { setInput(entry.text); setAttachments(entry.attachments || []); }
+      }
+    } catch (error) { if (activeSessionRef.current === sessionId) setRuntimeError(error.message || "无法移除待处理消息"); }
+  };
+
+  const changeQueuedInputBehavior = async (entry, behavior) => {
+    const sessionId = activeTaskId;
+    try { await transportRef.current.setQueuedInputBehavior(sessionId, entry.id, behavior); }
+    catch (error) { if (activeSessionRef.current === sessionId) setRuntimeError(error.message || "无法修改排队方式"); }
   };
 
   const decideApproval = async (approved, remember = false) => {
@@ -2222,6 +2297,7 @@ export function App() {
             </div>
 
             <div className="composer-wrap">
+              <QueuedInputs key={activeTaskId} entries={inputQueues[activeTaskId] || []} running={running || sendingInput} hasDraft={Boolean(input.trim() || attachments.length)} onResume={resumeQueuedInput} onRemove={removeQueuedInput} onBehavior={changeQueuedInputBehavior} />
               <div className={`composer ${running ? "is-running" : ""}`}>
                 <AttachmentList attachments={attachments} onRemove={removeAttachment} pending />
                 {attachmentError && <div className="attachment-error"><WarningCircle size={14} /><span>{attachmentError}</span></div>}
@@ -2229,14 +2305,13 @@ export function App() {
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
                       event.preventDefault();
                       submit();
                     }
                   }}
-                  placeholder={running ? "Agentx 正在执行任务，你可以等待或停止" : "给 Agentx 一个任务"}
+                  placeholder={running ? "继续输入，发送后排队，可点击 Steer 补充当前任务" : "给 Agentx 一个任务"}
                   rows={2}
-                  disabled={running}
                 />
                 <div className="composer-toolbar">
                   <div className="composer-tools">
@@ -2246,7 +2321,7 @@ export function App() {
                       title={attachments.length >= 8 ? "每条消息最多添加 8 个附件" : "添加图片或文本附件"}
                       aria-label="添加图片或文本附件"
                       onClick={chooseAttachments}
-                      disabled={running || attachmentPickerBusy || attachments.length >= 8}
+                      disabled={attachmentPickerBusy || attachments.length >= 8}
                     >
                       {attachmentPickerBusy ? <CircleNotch size={17} className="spin" /> : <Paperclip size={17} />}
                     </button>
@@ -2282,11 +2357,10 @@ export function App() {
                       <CaretDown size={12} />
                     </label>
                   </div>
-                  {running ? (
-                    <button className="send-button stop-button" onClick={() => transportRef.current?.abort(activeTaskId)} title="停止任务"><Stop size={16} weight="fill" /></button>
-                  ) : (
-                    <button className="send-button" onClick={submit} disabled={(!input.trim() && attachments.length === 0) || hasUnsupportedImage} title="发送"><ArrowUp size={17} weight="bold" /></button>
-                  )}
+                  <div className="composer-send-actions">
+                    {running && <button className="send-button stop-button" onClick={() => transportRef.current?.abort(activeTaskId).catch((error) => setRuntimeError(error.message))} title="停止任务" aria-label="停止任务"><Stop size={16} weight="fill" /></button>}
+                    <button className="send-button" onClick={submit} disabled={sendingInput || (!input.trim() && attachments.length === 0) || hasUnsupportedImage} title={running ? "排队发送" : "发送"} aria-label={running ? "排队发送" : "发送"}>{sendingInput ? <CircleNotch size={17} className="spin" /> : <ArrowUp size={17} weight="bold" />}</button>
+                  </div>
                 </div>
               </div>
             </div>

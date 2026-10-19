@@ -56,6 +56,12 @@ export function createMockTransport() {
   const listeners = new Set();
   const timers = new Set();
   let activeRun = null;
+  const mockInputs = new Map();
+  const publishQueue = (sessionId) => emit({ type: "queue.updated", sessionId, entries: [...mockInputs.values()].filter((entry) => entry.sessionId === sessionId) });
+  const pauseQueue = (sessionId) => {
+    for (const entry of mockInputs.values()) if (entry.sessionId === sessionId) { entry.status = "held"; entry.reason = "演示任务已停止，待处理消息已暂停"; }
+    publishQueue(sessionId);
+  };
   let mockPermission = "ask";
   let sequence = 0;
   let skills = [
@@ -317,7 +323,36 @@ export function createMockTransport() {
       return () => listeners.delete(listener);
     },
 
-    async prompt({ sessionId, text, attachments = [] }) {
+    async queueInput({ sessionId, text, attachments = [], behavior = "followUp", inputId }) {
+      if (mockInputs.size >= 20) throw new Error("最多保留 20 条待处理消息");
+      mockInputs.set(inputId, { id: inputId, sessionId, text, attachments, behavior, status: activeRun?.sessionId === sessionId ? "queued" : "held" });
+      publishQueue(sessionId);
+      return { accepted: true, queued: true };
+    },
+
+    async removeQueuedInput(sessionId, inputId) {
+      const entry = mockInputs.get(inputId);
+      if (entry?.sessionId !== sessionId) throw new Error("消息已被接收或移除");
+      mockInputs.delete(inputId);
+      publishQueue(sessionId);
+    },
+
+    async setQueuedInputBehavior(sessionId, inputId, behavior) {
+      const entry = mockInputs.get(inputId);
+      if (entry?.sessionId !== sessionId) throw new Error("消息已被接收或移除");
+      entry.behavior = behavior;
+      publishQueue(sessionId);
+    },
+
+    async prompt({ sessionId, text, attachments = [], queuedInputId }) {
+      if (queuedInputId) {
+        const entry = mockInputs.get(queuedInputId);
+        if (!entry || entry.sessionId !== sessionId) throw new Error("待处理消息不存在");
+        text = entry.text; attachments = entry.attachments;
+        mockInputs.delete(queuedInputId);
+        emit({ type: "input.consumed", sessionId, input: entry });
+        publishQueue(sessionId);
+      }
       clearTimers();
       const runId = `run-${Date.now()}`;
       const messageId = `msg-${Date.now()}`;
@@ -380,6 +415,7 @@ export function createMockTransport() {
         });
         emit({ type: "run.settled", sessionId, runId, status: "cancelled" });
         activeRun = null;
+        pauseQueue(sessionId);
         return;
       }
 
@@ -452,6 +488,9 @@ export function createMockTransport() {
         () => {
           emit({ type: "run.settled", sessionId, runId, status: "completed" });
           activeRun = null;
+          const queue = [...mockInputs.values()].filter((entry) => entry.sessionId === sessionId && entry.status === "queued");
+          const next = queue.find((entry) => entry.behavior === "steer") || queue[0];
+          if (next) this.prompt({ sessionId, queuedInputId: next.id });
         },
         2000,
         timers,
@@ -463,6 +502,7 @@ export function createMockTransport() {
       const { sessionId, runId } = activeRun;
       clearTimers();
       activeRun = null;
+      pauseQueue(sessionId);
       emit({ type: "run.settled", sessionId, runId, status: "aborted" });
     },
 
@@ -602,8 +642,20 @@ function createElectronTransport(bridge) {
       return bridge.command({ type: "setModel", providerId, modelId });
     },
 
-    prompt({ sessionId, text, attachments }) {
-      return bridge.command({ type: "prompt", sessionId, text, attachments });
+    prompt({ sessionId, text, attachments, queuedInputId }) {
+      return bridge.command({ type: "prompt", sessionId, text, attachments, queuedInputId });
+    },
+
+    queueInput(input) {
+      return bridge.command({ ...input, type: "queueInput" });
+    },
+
+    removeQueuedInput(sessionId, inputId) {
+      return bridge.command({ type: "removeQueuedInput", sessionId, inputId });
+    },
+
+    setQueuedInputBehavior(sessionId, inputId, behavior) {
+      return bridge.command({ type: "setQueuedInputBehavior", sessionId, inputId, behavior });
     },
 
     respondToApproval({ requestId, sessionId, approved, remember }) {

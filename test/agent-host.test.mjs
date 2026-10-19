@@ -82,6 +82,111 @@ async function waitFor(predicate) {
   throw new Error("Expected Agent Host event was not received");
 }
 
+test("queued inputs steer at tool boundaries, follow up in order, and pause on stop or failure", { timeout: 60_000 }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agentx-input-queue-"));
+  const agentDir = path.join(root, "agent");
+  const workspace = path.join(root, "workspace");
+  await mkdir(agentDir);
+  await mkdir(path.join(workspace, ".pi/prompts"), { recursive: true });
+  await writeFile(path.join(workspace, ".pi/prompts/review.md"), "Review template: $ARGUMENTS");
+  const requests = [];
+  const replies = [];
+  const held = [];
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    const reply = replies.shift() || { text: "Complete" };
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    const chunk = (delta, finish_reason = null) => response.write(`data: ${JSON.stringify({ id: `queue-${requests.length}`, object: "chat.completion.chunk", model: "queue-test", choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
+    chunk({ role: "assistant" });
+    const finish = () => {
+      if (reply.tool) chunk({ tool_calls: [{ index: 0, id: `write-${requests.length}`, type: "function", function: { name: "write", arguments: JSON.stringify({ path: "queue.txt", content: "approved" }) } }] }, "tool_calls");
+      else chunk({ content: reply.text || "Complete" }, "stop");
+      response.end("data: [DONE]\n\n");
+    };
+    if (reply.hold) { chunk({ content: "Working. " }); held.push({ finish, response, fail: () => {
+      response.write(`data: ${JSON.stringify({ error: { message: "Model stream failed", type: "server_error", code: "server_error" } })}\n\n`);
+      response.end();
+    } }); }
+    else finish();
+  });
+  let host;
+  t.after(async () => {
+    await host?.stop();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+  await writeFile(path.join(agentDir, "models.json"), JSON.stringify({ providers: { openai: { baseUrl, api: "openai-completions", models: [{ id: "queue-test", name: "Queue test", input: ["text", "image"], contextWindow: 128000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
+  await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false } }));
+  host = startHost(agentDir);
+  await host.command({ type: "saveModelSettings", providerId: "openai", modelId: "queue-test", baseUrl, apiKey: "local-test-key" });
+  const workspaceState = await host.command({ type: "initialize", cwd: workspace, tools: ["write"], modelValue: "openai::queue-test", permissionMode: "ask" });
+  replies.push({ hold: true, tool: true }, { text: "Steering applied" }, { text: "Follow-up one" }, { text: "Follow-up two" });
+  const running = host.command({ type: "prompt", text: "Initial request" });
+  await waitFor(() => held.length === 1);
+  const attachment = { id: "context", kind: "text", name: "note.txt", mimeType: "text/plain", size: 13, content: "queue context" };
+  await host.command({ type: "queueInput", inputId: "follow-1", text: "Later request", attachments: [attachment], behavior: "followUp" });
+  await host.command({ type: "queueInput", inputId: "follow-2", text: "Later request", attachments: [attachment], behavior: "followUp" });
+  await host.command({ type: "queueInput", inputId: "steer-1", text: "/review this change", behavior: "followUp" });
+  await host.command({ type: "setQueuedInputBehavior", inputId: "steer-1", behavior: "steer" });
+  await host.command({ type: "queueInput", inputId: "cancel-1", text: "Never execute this canceled message", behavior: "steer" });
+  await host.command({ type: "removeQueuedInput", inputId: "cancel-1" });
+  await host.command({ type: "queueInput", inputId: "steer-1", text: "Duplicate delivery", behavior: "steer" });
+  assert.equal((await host.command({ type: "getWorkspace" })).pendingInputs.length, 3);
+  assert.equal(host.events.filter((event) => event.type === "input.consumed").length, 0);
+  const initialHistory = await readFile(workspaceState.sessionFile, "utf8");
+  assert.ok(!initialHistory.includes("Later request"), "Pending inputs entered JSONL before being consumed");
+  held[0].finish();
+  const approval = await waitFor(() => host.events.find((event) => event.type === "approval.requested"));
+  assert.equal(requests.length, 1, "Steering interrupted an in-flight tool approval");
+  assert.equal(host.events.filter((event) => event.type === "input.consumed").length, 0);
+  await host.command({ type: "approvalResponse", requestId: approval.requestId, approved: true });
+  const completed = await running;
+  assert.equal(completed.status, "completed");
+  assert.ok(!JSON.stringify(requests).includes("Never execute this canceled message"));
+  assert.deepEqual(host.events.filter((event) => event.type === "input.consumed").map((event) => event.input.id), ["steer-1", "follow-1", "follow-2"]);
+  assert.match(JSON.stringify(requests[1].messages), /Review template: this change/);
+  assert.ok(!JSON.stringify(requests[1].messages).includes("Later request"));
+  assert.match(JSON.stringify(requests[2].messages), /queue context/);
+  assert.equal(host.events.filter((event) => event.type === "run.segment.settled").length, 3);
+  assert.equal(new Set(host.events.filter((event) => event.type === "message.started").map((event) => event.runId)).size, 4);
+  assert.equal((await host.command({ type: "getWorkspace" })).pendingInputs.length, 0);
+  assert.equal(completed.messages.filter((message) => message.role === "user").length, 4);
+
+  replies.push({ hold: true });
+  const stopped = host.command({ type: "prompt", text: "Task to stop" });
+  await waitFor(() => held.length === 2);
+  await host.command({ type: "queueInput", inputId: "paused-1", text: "Keep this pending", behavior: "steer" });
+  await host.command({ type: "queueInput", inputId: "paused-2", text: "Edit or remove this", behavior: "followUp" });
+  await host.command({ type: "abort" });
+  assert.equal((await stopped).status, "aborted");
+  const paused = await host.command({ type: "getWorkspace" });
+  assert.equal(paused.pendingInputs.length, 2);
+  assert.ok(paused.pendingInputs.every((entry) => entry.status === "held"));
+  assert.ok(!paused.messages.some((message) => message.text === "Keep this pending"));
+  await host.command({ type: "removeQueuedInput", inputId: "paused-2" });
+  replies.push({ text: "Explicitly resumed" });
+  const resumed = await host.command({ type: "prompt", queuedInputId: "paused-1" });
+  assert.ok(resumed.messages.some((message) => message.role === "user" && message.text === "Keep this pending"));
+  assert.equal((await host.command({ type: "getWorkspace" })).pendingInputs.length, 0);
+
+  replies.push({ hold: true });
+  const failed = host.command({ type: "prompt", text: "Task with a network failure" });
+  await waitFor(() => held.length === 3);
+  await host.command({ type: "queueInput", inputId: "after-error", text: "Do not run after failure", behavior: "followUp" });
+  held[2].fail();
+  await failed.catch(() => {});
+  const afterError = await host.command({ type: "getWorkspace" });
+  assert.equal(afterError.pendingInputs[0].id, "after-error");
+  assert.equal(afterError.pendingInputs[0].status, "held");
+  assert.ok(!afterError.messages.some((message) => message.text === "Do not run after failure"));
+});
+
 test("provider checks use draft config without saving credentials or creating a chat", { timeout: 45_000 }, async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "pi-provider-check-"));
   const agentDir = path.join(root, "agent");

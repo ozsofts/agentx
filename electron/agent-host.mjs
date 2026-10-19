@@ -11,6 +11,7 @@ import { execFile } from "node:child_process";
 import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
 import { SkillsService } from "./skills-service.mjs";
 import { describeRuntimeTool } from "./tool-registry.mjs";
 import { describeRequestError } from "./request-error.mjs";
@@ -40,6 +41,102 @@ let activeMessageId;
 let sequence = 0;
 const approvals = new Map();
 const rememberedApprovals = new Set();
+const queuedInputs = new Map();
+let enqueueChain = Promise.resolve();
+let enqueuingInput;
+let initialQueuedInput;
+let stopping = false;
+
+function inputQueueSnapshot() {
+  return [...queuedInputs.values()].map(({ sdkText, ...entry }) => entry);
+}
+
+function publishInputQueue() {
+  emit({ type: "queue.updated", sessionId: session.sessionId, entries: inputQueueSnapshot() });
+}
+
+function pauseInputQueue(reason) {
+  for (const entry of queuedInputs.values()) {
+    entry.status = "held";
+    entry.reason = reason;
+  }
+  session.clearQueue();
+  if (queuedInputs.size) publishInputQueue();
+}
+
+function consumeInput(entry) {
+  if (!queuedInputs.delete(entry.id)) return;
+  // A queued user input starts a distinct visible exchange, even though Pi can
+  // process several exchanges inside one agent loop / prompt() promise.
+  if (activeRunId && !initialQueuedInput) {
+    const completedAt = Date.now();
+    emit({ type: "run.segment.settled", sessionId: session.sessionId, runId: activeRunId,
+      status: "completed", completedAt, durationMs: completedAt - activeRunStartedAt });
+    activeRunId = `run-${randomUUID()}`;
+    activeRunStartedAt = Date.now();
+    activeMessageId = undefined;
+    activeRunError = undefined;
+  }
+  initialQueuedInput = undefined;
+  emit({ type: "input.consumed", sessionId: session.sessionId, runId: activeRunId,
+    input: { id: entry.id, text: entry.text, attachments: entry.attachments } });
+  publishInputQueue();
+}
+
+async function enqueueInput(command) {
+  const behavior = command.behavior || "followUp";
+  if (!["followUp", "steer"].includes(behavior)) throw new Error("未知的消息排队方式");
+  const id = String(command.inputId || randomUUID());
+  if (queuedInputs.has(id)) return { accepted: true, queued: true, inputId: id };
+  if (queuedInputs.size >= 20) throw new Error("最多保留 20 条待处理消息，请先处理或移除已有消息");
+  const attachments = normalizeAttachments(command.attachments);
+  if (attachments.some((item) => item.kind === "image") && !session.model?.input?.includes("image")) throw new Error("当前模型不支持图片输入");
+  const text = String(command.text || "").trim() || "请阅读并处理所附文件。";
+  if (Buffer.byteLength(JSON.stringify([...inputQueueSnapshot(), { text, attachments }]), "utf8") > 64 * 1024 * 1024) throw new Error("待处理消息总大小不能超过 64 MB");
+  const entry = { id, text, attachments, behavior, status: "queued", createdAt: Date.now() };
+  queuedInputs.set(id, entry);
+  if (stopping || !session.isStreaming) {
+    entry.status = "held";
+    entry.reason = "当前任务已停止或正在收尾，请继续发送";
+    publishInputQueue();
+    return { accepted: true, queued: true, inputId: id };
+  }
+  publishInputQueue();
+  return { accepted: true, queued: true, inputId: id };
+}
+
+async function deliverInputsAtBoundary(event) {
+  if (event.type !== "turn_end" || !activeRunId || stopping) return;
+  if (["error", "aborted"].includes(event.message.stopReason)) {
+    pauseInputQueue("任务已停止或失败，待处理消息已暂停");
+    return;
+  }
+  await enqueueChain;
+  if (stopping || !activeRunId) return;
+  const pending = [...queuedInputs.values()].filter((entry) => entry.status === "queued");
+  const steering = pending.filter((entry) => entry.behavior === "steer");
+  const candidates = steering.length ? steering : event.message.content.some((item) => item.type === "toolCall") ? [] : pending;
+  const mode = steering.length ? session.steeringMode : session.followUpMode;
+  const selected = mode === "all" ? candidates : candidates.slice(0, 1);
+  // Keep editable inputs in Desktop until this awaited Pi boundary. Pi 1.3
+  // exposes only clear-all queues; handing them over here makes per-item
+  // cancel/steer safe without mutating Pi's private queue implementation.
+  for (const entry of selected) {
+    if (!queuedInputs.has(entry.id) || entry.status !== "queued") continue;
+    entry.status = "delivering";
+    enqueuingInput = entry;
+    publishInputQueue();
+    try {
+      const disposition = await session[entry.behavior](buildPromptWithAttachments(entry.text, entry.attachments),
+        entry.attachments.filter((item) => item.kind === "image").map((item) => ({ type: "image", data: item.data, mimeType: item.mimeType })), { source: "rpc" });
+      if (disposition !== "queued") { entry.status = "held"; entry.reason = "消息未进入 Pi 队列，请编辑后重试"; }
+      if (stopping || !activeRunId || entry.status === "held") { pauseInputQueue("任务已结束或消息未被接收，待处理消息已暂停"); break; }
+    } catch (error) {
+      entry.status = "held";
+      entry.reason = error.message || "消息无法排队，请编辑后重试";
+    } finally { enqueuingInput = undefined; publishInputQueue(); }
+  }
+}
 
 function post(message) {
   parentPort.postMessage(message);
@@ -475,6 +572,18 @@ function reportRunError(error) {
 
 function onSessionEvent(event) {
   const sessionId = session.sessionId;
+  if (event.type === "queue_update") {
+    if (enqueuingInput && !enqueuingInput.sdkText) {
+      const values = enqueuingInput.behavior === "steer" ? event.steering : event.followUp;
+      enqueuingInput.sdkText = values.at(-1);
+    }
+    return;
+  }
+  if (event.type === "message_start" && event.message.role === "user") {
+    const text = stringifyContent(event.message.content);
+    const entry = initialQueuedInput || [...queuedInputs.values()].find((item) => item.status === "delivering" && item.sdkText === text);
+    if (entry) consumeInput(entry);
+  }
   if (event.type === "message_end" && event.message.role === "user") {
     // Public listeners run just before Pi appends the message. Wait for that
     // synchronous append, then announce the durable session before inference ends.
@@ -503,6 +612,7 @@ function onSessionEvent(event) {
   if (event.type === "message_end" && event.message.role === "assistant") {
     if (event.message.stopReason === "error") {
       activeRunError = describeRequestError(event.message.errorMessage, event.message);
+      pauseInputQueue("模型请求失败，待处理消息已暂停");
     }
     return;
   }
@@ -575,6 +685,8 @@ async function initialize(command) {
   for (const approval of approvals.values()) approval.resolve(false);
   approvals.clear();
   rememberedApprovals.clear();
+  queuedInputs.clear();
+  for (const entry of command.pendingInputs || []) queuedInputs.set(entry.id, { ...entry, status: "held", reason: "运行已中断，请继续发送" });
 
   cwd = path.resolve(command.cwd);
   await access(cwd);
@@ -608,7 +720,9 @@ async function initialize(command) {
     const configuredModel = providerId && modelId ? modelRuntime.getModel(providerId, modelId) : null;
     if (configuredModel) await session.setModel(configuredModel);
   }
-  unsubscribeSession = session.subscribe(onSessionEvent);
+  const unsubscribeEvents = session.subscribe(onSessionEvent);
+  const unsubscribeBoundaries = session.agent.subscribe(deliverInputsAtBoundary);
+  unsubscribeSession = () => { unsubscribeEvents(); unsubscribeBoundaries(); };
   skillsService = new SkillsService({
     cwd,
     reload: async () => {
@@ -639,6 +753,7 @@ async function initialize(command) {
     authenticated: availableModels.length > 0,
     permissionMode,
     messages: serializeMessages(session.messages),
+    pendingInputs: inputQueueSnapshot(),
   };
   workspaceInfo = result;
   emit({ type: "workspace.connected", ...result });
@@ -659,7 +774,7 @@ async function handleCommand(command) {
     if (!session) throw new Error("请先选择工作目录");
     return { ...workspaceInfo, sessionId: session.sessionId, sessionFile: session.sessionFile, permissionMode,
       model: session.model ? serializeModel(session.model) : null, messages: serializeMessages(session.messages),
-      running: Boolean(activeRunId || session.isStreaming), pendingApprovals: [...approvals.values()].map((item) => item.event).filter(Boolean) };
+      running: Boolean(activeRunId || session.isStreaming), pendingInputs: inputQueueSnapshot(), pendingApprovals: [...approvals.values()].map((item) => item.event).filter(Boolean) };
   }
   if (command.type === "importSession") return importSessionContent(command.content, path.resolve(command.cwd));
   if (command.type === "sessionInfo" || command.type === "exportSession") {
@@ -752,17 +867,39 @@ async function handleCommand(command) {
     }
     return { mode: permissionMode };
   }
+  if (command.type === "removeQueuedInput" || command.type === "setQueuedInputBehavior") {
+    const entry = queuedInputs.get(command.inputId);
+    if (!entry) throw new Error("消息已被接收或移除");
+    if (entry.status === "delivering" || entry === initialQueuedInput) throw new Error("消息正在被接收，无法再修改");
+    if (command.type === "setQueuedInputBehavior") {
+      if (!["followUp", "steer"].includes(command.behavior)) throw new Error("未知的消息排队方式");
+      entry.behavior = command.behavior;
+    } else queuedInputs.delete(command.inputId);
+    publishInputQueue();
+    return { updated: true };
+  }
+  if (command.type === "queueInput") {
+    if (!session) throw new Error("请先选择工作目录");
+    const operation = enqueueChain.then(() => enqueueInput(command));
+    enqueueChain = operation.catch(() => {});
+    return operation;
+  }
   if (command.type === "prompt") {
     if (!session) throw new Error("请先选择工作目录");
     if (activeRunId || session.isStreaming) throw new Error("此会话正在运行，请等待完成或先停止任务");
+    const resumed = command.queuedInputId ? queuedInputs.get(command.queuedInputId) : null;
+    if (command.queuedInputId && (!resumed || resumed.status !== "held")) throw new Error("待处理消息已变化，请刷新后重试");
+    if (resumed) command = { ...command, text: resumed.text, attachments: resumed.attachments };
     const attachments = normalizeAttachments(command.attachments);
     const images = attachments.filter((item) => item.kind === "image");
     if (images.length && !session.model?.input?.includes("image")) throw new Error(`当前模型 ${session.model?.name || session.model?.id || ""} 不支持图片输入`);
     const promptText = buildPromptWithAttachments(command.text, attachments);
-    activeRunId = `run-${Date.now()}`;
+    activeRunId = `run-${randomUUID()}`;
     activeRunStartedAt = Date.now();
     activeRunAborted = false;
     activeRunError = undefined;
+    initialQueuedInput = resumed;
+    stopping = false;
     try {
       await session.prompt(promptText, {
         source: "rpc",
@@ -772,10 +909,12 @@ async function handleCommand(command) {
       if (changes.files.length) emit({ type: "changes.available", sessionId: session.sessionId, runId: activeRunId, ...changes });
       const completedAt = Date.now();
       const status = activeRunAborted ? "aborted" : activeRunError ? "error" : "completed";
+      pauseInputQueue(status === "completed" ? "任务已结束，待处理消息已暂停" : "任务已停止或失败，待处理消息已暂停");
       if (status === "error") reportRunError(activeRunError);
       emit({ type: "run.settled", sessionId: session.sessionId, runId: activeRunId, status, completedAt, durationMs: completedAt - activeRunStartedAt });
       return { accepted: true, status, runId: activeRunId, sessionId: session.sessionId, sessionFile: session.sessionFile, messages: serializeMessages(session.messages) };
     } catch (error) {
+      pauseInputQueue("任务失败，待处理消息已暂停");
       reportRunError(describeRequestError(error.message || String(error), session.model));
       const completedAt = Date.now();
       emit({ type: "run.settled", sessionId: session.sessionId, runId: activeRunId, status: "error", completedAt, durationMs: completedAt - activeRunStartedAt });
@@ -786,6 +925,8 @@ async function handleCommand(command) {
       activeRunAborted = false;
       activeRunError = undefined;
       activeMessageId = undefined;
+      initialQueuedInput = undefined;
+      stopping = false;
     }
   }
   if (command.type === "approvalResponse") {
@@ -798,6 +939,8 @@ async function handleCommand(command) {
     return { resolved: true };
   }
   if (command.type === "abort") {
+    stopping = true;
+    if (session) pauseInputQueue("任务已停止，待处理消息已暂停");
     for (const approval of approvals.values()) approval.resolve(false);
     approvals.clear();
     await session?.abort();

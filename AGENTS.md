@@ -24,6 +24,12 @@ Model settings offer explicit draft-configuration testing and live provider mode
 
 Keep rendered Markdown headings compact and proportional to the surrounding body text, with restrained weight and spacing rather than oversized document-style titles.
 
+Show each reasoning block expanded while it is streaming and prevent collapsing it or its containing process group during that block. Collapse the block when reasoning ends, independently of the rest of the task, and allow reopening it without removing any recorded content. Restored reasoning starts collapsed.
+
+Keep the composer editable while a Session runs. Default additional messages to follow-up queuing and offer explicit steering at Pi's next assistant/tool boundary; steering never cancels an in-flight model call or command. Show pending inputs separately until Pi consumes them, then append a distinct user/assistant exchange in consumption order. Scope queues and drafts by Session. Stop and model failure pause unconsumed inputs for explicit resend, editing or removal; do not auto-run them after an error. Pending queues are runtime state, not persisted chat messages, and must not be added to the transcript until consumed.
+
+Present pending inputs as compact single rows joined to the top of the composer: queue icon and truncated message at left, inline Steer, trash and ellipsis at right. Allow per-item cancellation and conversion between follow-up and steering during a run. The more menu offers full content and moving the message back to the composer for editing, without overwriting an existing draft. Prevent modifying an input once delivery to Pi has begun.
+
 Keep the composer in normal layout flow so attachments and errors cannot cover the last messages. Stream output in small batches with stable Markdown renderer types. Follow new output only when the reader is near the bottom; preserve their position when reading earlier messages and offer a return-to-latest control. Avoid repeatedly restarting smooth scroll for tokens.
 
 Model request failures must be visible in the chat with a clear reason and expandable original details, remain visible after session restore, and mark the run as failed rather than completed.

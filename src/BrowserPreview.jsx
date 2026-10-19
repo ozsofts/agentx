@@ -29,7 +29,7 @@ export default function BrowserPreview({ id, url, state, visible, onUpdate }) {
       frame = requestAnimationFrame(() => {
         if (!ready || cancelled) return;
         const element = surface.current;
-        const blocked = !visible || !element?.getClientRects().length || element.closest("[hidden]") || element.querySelector(".preview-error") || document.querySelector(".modal-backdrop, .work-operation-menu, .project-session-popover, .work-panel.is-resizing");
+        const blocked = !visible || !element?.getClientRects().length || element.closest("[hidden]") || element.querySelector(".preview-error") || document.querySelector(".modal-backdrop, .work-operation-menu, .input-queue-menu, .project-session-popover, .work-panel.is-resizing");
         const rect = element?.getBoundingClientRect();
         const operation = blocked ? { type: "hide", id } : { type: "bounds", id, bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
         const signature = JSON.stringify(operation);

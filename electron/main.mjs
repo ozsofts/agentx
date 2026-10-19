@@ -34,6 +34,7 @@ let browserService;
 let agentHost;
 const agentHosts = new Set();
 const sessionRuntimeSettings = new Map();
+const interruptedInputs = new Map();
 let projectSync = Promise.resolve();
 let requestSequence = 0;
 const pendingRequests = new Map();
@@ -126,6 +127,7 @@ function startAgentHost() {
       if (event.type === "workspace.connected") { host.workspace = event; return; }
       if (event.type === "run.started") host.running = true;
       if (event.type === "run.settled") host.running = false;
+      if (event.type === "queue.updated" && host.workspace) host.workspace.pendingInputs = event.entries;
       if (event.type === "models.updated" && host.workspace) host.workspace.model = event.model;
       if (event.type === "session.updated") {
         host.workspace = { ...host.workspace, sessionFile: event.sessionFile };
@@ -158,6 +160,11 @@ function startAgentHost() {
       pendingRequests.delete(requestId);
     }
     if (host.closing) return;
+    if (host.workspace?.pendingInputs?.length) {
+      const entries = host.workspace.pendingInputs.map((entry) => ({ ...entry, status: "held", reason: "Agent Host 已退出，请重新打开会话后继续发送" }));
+      interruptedInputs.set(host.workspace.sessionFile, entries);
+      mainWindow?.webContents.send("agent:event", { type: "queue.updated", sessionId: host.workspace.sessionId, entries });
+    }
     mainWindow?.webContents.send("agent:event", {
       type: "runtime.error",
       sessionId: host.workspace?.sessionId,
@@ -184,7 +191,7 @@ function commandHost(command, target) {
 // overrides for reopening idle sessions, rather than retaining a process per tab.
 function releaseIdleHosts() {
   for (const host of agentHosts) {
-    if (host === agentHost || host.running || !host.workspace || [...pendingRequests.values()].some((item) => item.host === host)) continue;
+    if (host === agentHost || host.running || host.workspace?.pendingInputs?.length || !host.workspace || [...pendingRequests.values()].some((item) => item.host === host)) continue;
     const { sessionFile, permissionMode, model } = host.workspace;
     if (sessionFile) sessionRuntimeSettings.set(sessionFile, { permissionMode, modelValue: model ? `${model.provider}::${model.id}` : null });
     host.closing = true;
@@ -256,7 +263,9 @@ async function initializeWorkspace(cwd, sessionFile, projectId) {
     toolIds: effectiveToolIds,
     tools: runtimeToolNames(effectiveToolIds),
     sessionFile: sessionFile && existsSync(sessionFile) ? sessionFile : undefined,
+    pendingInputs: interruptedInputs.get(sessionFile),
   }, host);
+  interruptedInputs.delete(sessionFile);
   agentHost = host;
   host.workspace = { ...result, projectId: projectId || null };
   await writeState({ cwd, sessionId: result.sessionId, sessionFile: result.sessionFile, projectId: projectId || null, updatedAt: Date.now() });
