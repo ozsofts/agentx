@@ -3,11 +3,10 @@ import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
+import { desktopRuntime } from "./desktop-runtime.mjs";
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const require = createRequire(import.meta.url);
-const electronBinary = require("electron");
+const electronBinary = await desktopRuntime();
 const preferredPort = Number(process.env.PI_DESKTOP_RENDERER_PORT || 4174);
 
 function canListen(port) {

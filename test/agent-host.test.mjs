@@ -82,6 +82,74 @@ async function waitFor(predicate) {
   throw new Error("Expected Agent Host event was not received");
 }
 
+test("provider checks use draft config without saving credentials or creating a chat", { timeout: 45_000 }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-provider-check-"));
+  const agentDir = path.join(root, "agent");
+  await mkdir(agentDir);
+  let host;
+  let status = 200;
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    requests.push({ url: request.url, key: request.headers.authorization, body: body && JSON.parse(body) });
+    if (status !== 200) {
+      response.writeHead(status, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { message: `Insufficient Balance ${request.headers.authorization}` } }));
+    } else if (request.method === "GET") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: [{ id: "check-chat" }, { id: "not-in-pi" }] }));
+    } else {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(`data: ${JSON.stringify({ id: "check", object: "chat.completion.chunk", model: "check-chat", choices: [{ index: 0, delta: { role: "assistant", content: "OK" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    }
+  });
+  t.after(async () => {
+    await host?.stop();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+  await writeFile(path.join(agentDir, "models.json"), JSON.stringify({ providers: { openai: {
+    baseUrl, api: "openai-completions", models: [{ id: "check-chat", name: "Check Chat", reasoning: false, input: ["text"],
+      contextWindow: 32000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+  } } }));
+  host = startHost(agentDir);
+  await host.command({ type: "saveModelSettings", providerId: "openai", modelId: "check-chat", baseUrl, apiKey: "saved-key" });
+  const authBefore = await readFile(path.join(agentDir, "auth.json"), "utf8");
+  const modelsBefore = await readFile(path.join(agentDir, "models.json"), "utf8");
+  const eventCountBefore = host.events.length;
+  const draft = { providerId: "openai", modelId: "check-chat", baseUrl: `${baseUrl}/draft`, apiKey: "draft-key" };
+  const tested = await host.command({ type: "testModelSettings", ...draft });
+  assert.equal(tested.ok, true, JSON.stringify(tested));
+  assert.equal(requests[0].url, "/v1/draft/chat/completions");
+  assert.equal(requests[0].key, "Bearer draft-key");
+  assert.equal(requests[0].body.messages.length, 1);
+  assert.deepEqual(requests[0].body.messages[0].content, [{ type: "text", text: "Reply with OK only." }]);
+  assert.ok(!requests[0].body.tools?.length);
+  const catalog = await host.command({ type: "fetchProviderModels", ...draft });
+  assert.equal(catalog.ok, true, JSON.stringify(catalog));
+  assert.equal(requests.at(-1).url, "/v1/draft/models");
+  assert.equal(catalog.models.find((model) => model.id === "check-chat").selectable, true);
+  assert.equal(catalog.models.find((model) => model.id === "not-in-pi").selectable, false);
+  const stored = await host.command({ type: "fetchProviderModels", providerId: "openai", modelId: "check-chat" });
+  assert.equal(stored.ok, true, JSON.stringify(stored));
+  assert.equal(requests.at(-1).key, "Bearer saved-key");
+  assert.equal(requests.at(-1).url, "/v1/models");
+  status = 402;
+  const failed = await host.command({ type: "testModelSettings", ...draft });
+  assert.equal(failed.ok, false);
+  assert.match(failed.error.message, /余额或额度不足/);
+  assert.ok(!JSON.stringify(failed).includes("draft-key"));
+  assert.equal(await readFile(path.join(agentDir, "auth.json"), "utf8"), authBefore);
+  assert.equal(await readFile(path.join(agentDir, "models.json"), "utf8"), modelsBefore);
+  assert.equal((await host.command({ type: "getModelSettings" })).currentModel, null);
+  assert.equal(host.events.length, eventCountBefore, "Provider checks must not emit chat or settings changes");
+});
+
 test("Pi upgrade preserves the real Host protocol, permissions, attachments and sessions", { timeout: 90_000 }, async (t) => {
   assert.equal(VERSION, "1.3.0");
   assert.ok(TOOL_CATALOG.every((tool) => tool.version === VERSION));
@@ -150,6 +218,7 @@ test("Pi upgrade preserves the real Host protocol, permissions, attachments and 
   const initialize = (extra = {}) => host.command({ type: "initialize", cwd: workspace,
     tools: ["read", "write", "edit", "bash"], modelValue: "openai::desktop-smoke", permissionMode: "read-only", ...extra });
   const connected = await initialize();
+  assert.equal(connected.permissionMode, "read-only");
   assert.equal(connected.model.id, "desktop-smoke");
   assert.equal(connected.authenticated, true);
   assert.equal(connected.availableModels.find((model) => model.id === "desktop-smoke").input.includes("image"), true);
@@ -183,13 +252,30 @@ test("Pi upgrade preserves the real Host protocol, permissions, attachments and 
   assert.equal(await readFile(path.join(workspace, "approved.txt"), "utf8"), "approved");
 
   await host.command({ type: "setPermissionMode", mode: "full" });
+  const approvalsBeforeFull = host.events.filter((event) => event.type === "approval.requested").length;
   responses.push({ tools: [["edit", { path: "approved.txt", edits: [{ oldText: "approved", newText: "edited" }] }], ["bash", { command: "printf desktop-smoke" }]] }, { text: "Tools complete." });
   await host.command({ type: "prompt", text: "Edit and run a command" });
   assert.equal(await readFile(path.join(workspace, "approved.txt"), "utf8"), "edited");
   assert.ok(host.events.some((event) => event.type === "tool.completed" && event.output.includes("desktop-smoke")));
+  assert.equal(host.events.filter((event) => event.type === "approval.requested").length, approvalsBeforeFull);
+  assert.equal((await host.command({ type: "getWorkspace" })).permissionMode, "full");
   await host.command({ type: "renameSession", sessionId: first.sessionId, sessionFile: first.sessionFile, name: "Upgrade smoke" });
   const installed = await host.command({ type: "installSkill", catalogId: "project-overview", skillName: "project-overview" });
   assert.ok(installed.skills.some((skill) => skill.name === "project-overview" && skill.installed));
+  const skillCommand = "/skill:project-overview Summarize the workspace";
+  responses.push({ text: "Skill complete." });
+  const skillRun = await host.command({ type: "prompt", text: skillCommand, attachments: [
+    { id: "skill-context", kind: "text", name: "scope.md", mimeType: "text/markdown", content: "Only summarize notes.txt", size: 24 },
+  ] });
+  const skillUser = skillRun.messages.filter((message) => message.role === "user").at(-1);
+  assert.equal(skillUser.text, skillCommand);
+  assert.equal(skillUser.attachments[0].name, "scope.md");
+  const modelSkillInput = JSON.stringify(requests.at(-1).messages.filter((message) => message.role === "user").at(-1));
+  assert.ok(modelSkillInput.includes('<skill name=\\"project-overview\\"'));
+  assert.ok(modelSkillInput.includes("Only summarize notes.txt"));
+  assert.match(await readFile(skillRun.sessionFile, "utf8"), /<skill name=/);
+  const skillSaved = host.events.filter((event) => event.type === "session.updated").at(-1);
+  assert.equal(skillSaved.messages.filter((message) => message.role === "user").at(-1).text, skillCommand);
   const removed = await host.command({ type: "removeSkill", name: "project-overview" });
   assert.ok(removed.skills.some((skill) => skill.name === "project-overview" && !skill.installed));
   await host.stop();
@@ -200,6 +286,8 @@ test("Pi upgrade preserves the real Host protocol, permissions, attachments and 
   assert.equal(settings.providers.find((provider) => provider.id === "openai").baseUrl, baseUrl);
   const restored = await initialize({ sessionFile: first.sessionFile });
   assert.equal(restored.sessionId, first.sessionId);
+  const restoredSkill = restored.messages.find((message) => message.role === "user" && message.text === skillCommand);
+  assert.equal(restoredSkill.attachments[0].name, "scope.md");
   const user = restored.messages.find((message) => message.role === "user");
   assert.equal(user.attachments.length, 2);
   assert.ok(user.attachments.find((item) => item.kind === "image").data);
@@ -215,6 +303,15 @@ test("Pi upgrade preserves the real Host protocol, permissions, attachments and 
   responses.push({ hold: true });
   const active = host.command({ type: "prompt", text: "Wait for cancellation" });
   await waitFor(() => host.events.find((event) => event.type === "message.delta" && event.text === "Working"));
+  const liveWorkspace = await host.command({ type: "getWorkspace" });
+  assert.equal(liveWorkspace.running, true);
+  const savedEvent = host.events.filter((event) => event.type === "session.updated").at(-1);
+  assert.equal(savedEvent.sessionId, restored.sessionId);
+  assert.ok(savedEvent.messages.some((message) => message.role === "user" && message.text === "Wait for cancellation"));
+  assert.match(await readFile(savedEvent.sessionFile, "utf8"), /Wait for cancellation/);
+  await assert.rejects(host.command({ type: "assertSessionIdle" }), /会话正在运行/);
+  await assert.rejects(initialize(), /会话正在运行/);
+  await assert.rejects(host.command({ type: "exportSession", format: "html" }), /会话正在运行/);
   await host.command({ type: "abort" });
   await active;
   assert.equal(host.events.filter((event) => event.type === "run.settled").at(-1).status, "aborted");

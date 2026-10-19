@@ -5,6 +5,7 @@ import {
   SettingsManager,
   createAgentSession,
   getAgentDir,
+  parseSkillBlock,
 } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
 import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -13,6 +14,8 @@ import { promisify } from "node:util";
 import { SkillsService } from "./skills-service.mjs";
 import { describeRuntimeTool } from "./tool-registry.mjs";
 import { describeRequestError } from "./request-error.mjs";
+import { importSessionContent } from "./session-transfer.mjs";
+import { modelDiscoverySupport, runProviderOperation } from "./provider-settings.mjs";
 
 const execFileAsync = promisify(execFile);
 const parentPort = process.parentPort;
@@ -27,6 +30,7 @@ let modelRuntime;
 let resourceLoader;
 let skillsService;
 let cwd;
+let workspaceInfo;
 let permissionMode = "ask";
 let activeRunId;
 let activeRunStartedAt;
@@ -139,7 +143,12 @@ function serializeMessages(messages) {
     if (message.role === "user") {
       assistant = undefined;
       turnStartedAt = timestamp;
-      const parsed = parsePromptAttachments(stringifyContent(message.content));
+      const rawText = stringifyContent(message.content);
+      const skill = parseSkillBlock(rawText);
+      // Pi persists expanded skill instructions for inference. Project them back
+      // to the invocation for chat without changing the model/session content.
+      const displayText = skill ? `/skill:${skill.name}${skill.userMessage ? ` ${skill.userMessage}` : ""}` : rawText;
+      const parsed = parsePromptAttachments(displayText);
       const imageContent = Array.isArray(message.content) ? message.content.filter((item) => item?.type === "image") : [];
       let imageIndex = 0;
       const attachments = parsed.attachments.map((item) => {
@@ -284,6 +293,7 @@ async function getModelSettings() {
       configured: authStatus.configured,
       authSource: authStatus.source,
       apiKeySupported: Boolean(provider.auth?.apiKey),
+      discovery: modelDiscoverySupport(provider, runtime.getModels(provider.id)),
       models: runtime.getModels(provider.id).map(serializeModel),
     };
   }).filter((provider) => provider.models.length > 0);
@@ -394,7 +404,7 @@ function requestApproval(event) {
   const summary = summarizeTool(event.toolName, event.input);
   const approvalKey = `${event.toolName}:${summary.command}`;
   if (rememberedApprovals.has(approvalKey)) return Promise.resolve(true);
-  emit({
+  const approvalEvent = {
     type: "approval.requested",
     sessionId: session.sessionId,
     runId: activeRunId,
@@ -404,8 +414,9 @@ function requestApproval(event) {
     command: summary.command,
     cwd,
     reason: `${summary.title}需要你的确认`,
-  });
-  return new Promise((resolve) => approvals.set(requestId, { resolve, approvalKey }));
+  };
+  emit(approvalEvent);
+  return new Promise((resolve) => approvals.set(requestId, { resolve, approvalKey, event: approvalEvent }));
 }
 
 const permissionExtension = {
@@ -464,6 +475,14 @@ function reportRunError(error) {
 
 function onSessionEvent(event) {
   const sessionId = session.sessionId;
+  if (event.type === "message_end" && event.message.role === "user") {
+    // Public listeners run just before Pi appends the message. Wait for that
+    // synchronous append, then announce the durable session before inference ends.
+    queueMicrotask(() => {
+      emit({ type: "session.updated", ...workspaceInfo, sessionId, cwd, sessionFile: session.sessionFile,
+        messages: serializeMessages(session.messages) });
+    });
+  }
   if (event.type === "agent_settled") {
     activeRunAborted = event.aborted;
     return;
@@ -618,20 +637,40 @@ async function initialize(command) {
     toolIds: Array.isArray(command.toolIds) ? command.toolIds : [],
     availableModels: availableModels.slice(0, 200).map(serializeModel),
     authenticated: availableModels.length > 0,
+    permissionMode,
     messages: serializeMessages(session.messages),
   };
+  workspaceInfo = result;
   emit({ type: "workspace.connected", ...result });
   emit({
     type: "runtime.status",
     connected: true,
     authenticated: result.authenticated,
     model: result.model,
-    message: result.authenticated ? "Pi SDK 已连接" : "Pi SDK 已连接，但尚未配置模型凭据",
+    message: result.authenticated ? "Agentx 已就绪" : "Agentx 已连接，但尚未配置模型凭据",
   });
   return result;
 }
 
 async function handleCommand(command) {
+  if (["initialize", "newSession", "openSession", "renameSession", "assertSessionIdle", "importSession", "exportSession"].includes(command.type) && (activeRunId || session?.isStreaming)) throw new Error("会话正在运行，请等待完成或先停止任务");
+  if (command.type === "assertSessionIdle") return { idle: true };
+  if (command.type === "getWorkspace") {
+    if (!session) throw new Error("请先选择工作目录");
+    return { ...workspaceInfo, sessionId: session.sessionId, sessionFile: session.sessionFile, permissionMode,
+      model: session.model ? serializeModel(session.model) : null, messages: serializeMessages(session.messages),
+      running: Boolean(activeRunId || session.isStreaming), pendingApprovals: [...approvals.values()].map((item) => item.event).filter(Boolean) };
+  }
+  if (command.type === "importSession") return importSessionContent(command.content, path.resolve(command.cwd));
+  if (command.type === "sessionInfo" || command.type === "exportSession") {
+    if (!session || (command.sessionId && command.sessionId !== session.sessionId)) throw new Error("当前会话已切换，请重试");
+    if (command.type === "exportSession") {
+      if (!session.sessionFile) throw new Error("请先发送消息并保存会话");
+      if (command.format === "html") { await session.exportToHtml(command.outputPath); return { exported: true }; }
+      throw new Error("不支持的导出格式");
+    }
+    return { sessionId: session.sessionId, sessionFile: session.sessionFile || null, cwd, model: session.model ? serializeModel(session.model) : null, permissionMode, stats: session.getSessionStats() };
+  }
   if (command.type === "initialize") return initialize(command);
   if (command.type === "listSessions") {
     const listCwd = path.resolve(command.cwd || cwd || process.cwd());
@@ -660,6 +699,7 @@ async function handleCommand(command) {
     return { sessions: items.map(serializeSessionInfo) };
   }
   if (command.type === "getModelSettings") return getModelSettings();
+  if (["testModelSettings", "fetchProviderModels"].includes(command.type)) return runProviderOperation(await ensureModelRuntime(), command);
   if (command.type === "saveModelSettings") return saveModelSettings(command);
   if (command.type === "clearProviderCredential") return clearProviderCredential(command);
   if (command.type === "listSkills") {
@@ -703,10 +743,18 @@ async function handleCommand(command) {
   if (command.type === "setPermissionMode") {
     if (!["read-only", "ask", "full"].includes(command.mode)) throw new Error("Unknown permission mode");
     permissionMode = command.mode;
+    if (permissionMode === "full") {
+      for (const [requestId, approval] of approvals) {
+        approvals.delete(requestId);
+        approval.resolve(true);
+        emit({ type: "approval.resolved", sessionId: session?.sessionId, requestId, approved: true });
+      }
+    }
     return { mode: permissionMode };
   }
   if (command.type === "prompt") {
     if (!session) throw new Error("请先选择工作目录");
+    if (activeRunId || session.isStreaming) throw new Error("此会话正在运行，请等待完成或先停止任务");
     const attachments = normalizeAttachments(command.attachments);
     const images = attachments.filter((item) => item.kind === "image");
     if (images.length && !session.model?.input?.includes("image")) throw new Error(`当前模型 ${session.model?.name || session.model?.id || ""} 不支持图片输入`);

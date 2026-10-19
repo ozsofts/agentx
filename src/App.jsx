@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   ArrowCounterClockwise,
   ArrowUp,
+  ArrowDown,
   CaretDown,
   CaretRight,
   Check,
@@ -14,7 +15,6 @@ import {
   Columns,
   Copy,
   Cpu,
-  DotsThree,
   FileCode,
   FileText,
   FolderOpen,
@@ -40,11 +40,18 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { createTransport } from "./transport.js";
+import { markdownFilePath } from "./markdown-file-path.js";
+import WorkPanel from "./WorkPanel.jsx";
+import SessionActions from "./SessionActions.jsx";
+import MermaidPreview from "./MermaidPreview.jsx";
+import useThreadScroll from "./useThreadScroll.js";
+import Modal from "./Modal.jsx";
+import CollapsedProjectSessions from "./CollapsedProjectSessions.jsx";
 
 const desktopMode = Boolean(window.piDesktop);
 
 const initialTasks = [
-  { id: "pi-shell", title: "构建 Pi 桌面端工作区", repo: "pi-desktop", branch: "main", time: "刚刚", status: "done" },
+  { id: "pi-shell", title: "构建 Agentx 桌面端工作区", repo: "agentx", branch: "main", time: "刚刚", status: "done" },
   { id: "rpc-events", title: "统一 RPC 事件协议", repo: "pi-gateway", branch: "feat/events", time: "18 分钟", status: "idle" },
   { id: "permission", title: "设计命令权限策略", repo: "pi-desktop", branch: "feat/permissions", time: "昨天", status: "idle" },
   { id: "sessions", title: "恢复持久化会话", repo: "pi-runtime", branch: "main", time: "昨天", status: "idle" },
@@ -52,7 +59,7 @@ const initialTasks = [
 
 const starterSessions = {
   "pi-shell": [
-    { id: "u1", role: "user", text: "基于 Pi Agent 做一个类似 Codex 的本地桌面客户端，先把核心工作区搭起来。" },
+    { id: "u1", role: "user", text: "构建 Agentx 本地桌面客户端，先把核心工作区搭起来。" },
     {
       id: "a1",
       role: "assistant",
@@ -252,44 +259,60 @@ function MarkdownCodeBlock({ node: _node, children, ...props }) {
           {copied ? <Check size={14} /> : <Copy size={14} />}
         </button>
       </div>
-      <pre {...props}>{children}</pre>
+      {language === "mermaid" ? <><div className="markdown-mermaid"><MermaidPreview source={code} /></div><details className="mermaid-source"><summary>查看图表源码</summary><pre {...props}>{children}</pre></details></> : <pre {...props}>{children}</pre>}
     </div>
   );
 }
 
-function MarkdownContent({ children }) {
-  return (
-    <div className="markdown-body">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
+const markdownPlugins = [remarkGfm];
+
+const MarkdownContent = memo(function MarkdownContent({ children, resourceUrl, onOpenFile }) {
+  // Stable renderer types keep code blocks, copy state and diagrams mounted
+  // when another token arrives instead of replacing their DOM on every update.
+  const components = useMemo(() => ({
           a({ node: _node, href, children: linkChildren, ...props }) {
             const external = /^https?:\/\//i.test(href || "");
+            if (onOpenFile && href && !/^(?:[a-z][a-z\d+.-]*:|#)/i.test(href)) {
+              return <a href={href} {...props} onClick={(event) => {
+                event.preventDefault();
+                onOpenFile(markdownFilePath(href, resourceUrl));
+              }}>{linkChildren}</a>;
+            }
             return <a href={href} {...(external ? { target: "_blank", rel: "noreferrer" } : {})} {...props}>{linkChildren}</a>;
           },
           table({ node: _node, children: tableChildren, ...props }) {
             return <div className="markdown-table-wrap"><table {...props}>{tableChildren}</table></div>;
           },
           img({ node: _node, alt, ...props }) {
+            if (resourceUrl?.startsWith("pi-preview:") && props.src && !/^[a-z][a-z\d+.-]*:/i.test(props.src)) {
+              const imageUrl = new URL(props.src, resourceUrl);
+              imageUrl.searchParams.set("v", new URL(resourceUrl).searchParams.get("v") || "0");
+              props.src = imageUrl.href;
+            }
             return <img alt={alt || ""} loading="lazy" {...props} />;
           },
           pre: MarkdownCodeBlock,
-        }}
+  }), [resourceUrl, onOpenFile]);
+  return (
+    <div className="markdown-body">
+      <ReactMarkdown
+        remarkPlugins={markdownPlugins}
+        components={components}
       >
         {children}
       </ReactMarkdown>
     </div>
   );
-}
+});
 
-function Message({ message, onReview }) {
+function Message({ message, onReview, onOpenFile }) {
   if (message.role === "user") {
     return <div className="user-message"><AttachmentList attachments={message.attachments} />{message.text && <div className="user-message-text">{message.text}</div>}</div>;
   }
   return (
     <article className="assistant-message">
       {message.activities?.length > 0 && <ProcessGroup message={message} />}
-      {message.text && <MarkdownContent>{message.text}</MarkdownContent>}
+      {message.text && <MarkdownContent onOpenFile={onOpenFile}>{message.text}</MarkdownContent>}
       {message.error && (
         <div className="message-error" role="alert">
           <div className="message-error-title"><WarningCircle size={17} weight="fill" /><strong>请求失败</strong></div>
@@ -312,8 +335,11 @@ function Message({ message, onReview }) {
   );
 }
 
-function Sidebar({ tasks, projects, activeProjectId, activeTaskId, onSelect, onProjectSelect, onSessionSelect, onRenameSession, onCreateProject, onCreateSession, onManageProject, onNew, collapsed, onCollapse, runtime, activeView, onManagement }) {
+function Sidebar({ tasks, projects, runningSessions, activeProjectId, activeTaskId, onSelect, onProjectSelect, onSessionSelect, onRenameSession, onCreateProject, onCreateSession, onManageProject, onNew, collapsed, onCollapse, runtime, activeView, onManagement }) {
   const [query, setQuery] = useState("");
+  const [flyoutProjectId, setFlyoutProjectId] = useState(null);
+  const closeFlyout = useCallback((id) => setFlyoutProjectId((current) => current === id ? null : current), []);
+  useEffect(() => { setFlyoutProjectId(null); }, [collapsed, activeTaskId, activeView]);
   const normalizedQuery = query.trim().toLowerCase();
   const visibleProjects = projects.filter((project) => {
     if (!normalizedQuery) return true;
@@ -339,7 +365,7 @@ function Sidebar({ tasks, projects, activeProjectId, activeTaskId, onSelect, onP
         ) : (
           <>
             <div className="brand-mark"><TerminalWindow size={18} weight="bold" /></div>
-            <span className="brand-name">Pi Agent</span>
+            <span className="brand-name">Agentx</span>
             <button className="icon-button collapse-button" onClick={onCollapse} title="收起侧栏" aria-label="收起侧栏">
               <SidebarSimple size={18} />
             </button>
@@ -370,7 +396,17 @@ function Sidebar({ tasks, projects, activeProjectId, activeTaskId, onSelect, onP
         {visibleProjects.map((project) => (
           <div className={`project-nav-group ${project.archived ? "is-archived" : ""}`} key={project.id}>
             <div className="project-nav-item-wrap">
-              <button
+              {collapsed ? <CollapsedProjectSessions
+                project={project}
+                active={activeProjectId === project.id}
+                activeTaskId={activeTaskId}
+                runningSessions={runningSessions}
+                open={flyoutProjectId === project.id}
+                onOpen={setFlyoutProjectId}
+                onClose={closeFlyout}
+                onSessionSelect={onSessionSelect}
+                onCreateSession={onCreateSession}
+              /> : <button
                 className={`project-nav-item ${activeProjectId === project.id ? "is-active" : ""}`}
                 onClick={() => onProjectSelect(project.id)}
                 title={project.rootPath}
@@ -382,7 +418,7 @@ function Sidebar({ tasks, projects, activeProjectId, activeTaskId, onSelect, onP
                     <span className="task-meta">{project.archived ? "已归档 · " : ""}{project.sessions?.filter((session) => !session.archived).length || 0} 个 Session</span>
                   </span>
                 )}
-              </button>
+              </button>}
               {!collapsed && <div className="project-nav-actions">
                 <button className="project-nav-action" onClick={() => onCreateSession(project)} title="新建 Session" aria-label="新建 Session"><Plus size={14} weight="bold" /></button>
                 <button className="project-nav-action" onClick={() => onManageProject(project.id)} title="编辑当前项目" aria-label="编辑当前项目"><PencilSimple size={14} /></button>
@@ -397,8 +433,9 @@ function Sidebar({ tasks, projects, activeProjectId, activeTaskId, onSelect, onP
                       onClick={() => onSessionSelect(project, session)}
                       title={session.title}
                     >
-                      <FileText size={14} />
+                      {runningSessions[session.sessionId] ? <CircleNotch size={14} className="spin session-running-icon" aria-label="正在处理" /> : <FileText size={14} />}
                       <span>{session.title || "未命名会话"}</span>
+                      {runningSessions[session.sessionId] && <small className="session-running-label">进行中</small>}
                     </button>
                     <button className="project-session-action" onClick={() => onRenameSession(project, session)} title="重命名 Session" aria-label="重命名 Session"><PencilSimple size={13} /></button>
                   </div>
@@ -430,7 +467,7 @@ function Sidebar({ tasks, projects, activeProjectId, activeTaskId, onSelect, onP
       </nav>
 
       <div className="sidebar-footer">
-        <button className={`footer-action ${activeView === "management" ? "is-active" : ""}`} title="管理" aria-label="管理" onClick={onManagement}>
+        <button className={`footer-action ${activeView === "management" ? "is-active" : ""}`} title={activeView === "management" ? "返回聊天" : "管理"} aria-label="管理" aria-pressed={activeView === "management"} onClick={onManagement}>
           <GearSix size={18} />
           {!collapsed && <span>管理</span>}
         </button>
@@ -465,20 +502,20 @@ function ProjectCreateDialog({ open, onClose, onChooseFolder, onCreate, busy, er
   };
 
   return (
-    <div className="modal-backdrop" role="presentation">
+    <Modal onClose={() => !busy && onClose()}>
       <section className="small-dialog" role="dialog" aria-modal="true" aria-labelledby="project-create-title">
         <header className="small-dialog-header">
           <div><span className="project-dialog-icon"><FolderOpen size={18} /></span><div><h2 id="project-create-title">新建项目</h2><p>项目目录用于保存工作区关联和 Session 索引</p></div></div>
           <button className="icon-button" onClick={onClose} title="关闭"><X size={18} /></button>
         </header>
         <form className="small-dialog-form" onSubmit={submit}>
-          <label className="field-control"><span>项目名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：Pi Desktop" /></label>
+          <label className="field-control"><span>项目名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：Agentx" /></label>
           <label className="field-control"><span>项目目录</span><div className="path-picker"><input value={rootPath} onChange={(event) => setRootPath(event.target.value)} placeholder="选择或输入项目目录" /><button type="button" className="button-secondary" onClick={async () => { const selected = await onChooseFolder(); if (selected) setRootPath(selected); }}><FolderOpen size={14} />选择</button></div></label>
           {error && <div className="settings-error"><WarningCircle size={15} />{error}</div>}
           <div className="small-dialog-actions"><button type="button" className="button-quiet" onClick={onClose}>取消</button><button type="submit" className="button-primary" disabled={busy || !name.trim() || !rootPath.trim()}>{busy ? "创建中…" : "创建项目"}</button></div>
         </form>
       </section>
-    </div>
+    </Modal>
   );
 }
 
@@ -498,7 +535,7 @@ function SessionRenameDialog({ target, onClose, onSave, busy, error }) {
   };
 
   return (
-    <div className="modal-backdrop" role="presentation">
+    <Modal onClose={() => !busy && onClose()}>
       <section className="small-dialog rename-dialog" role="dialog" aria-modal="true" aria-labelledby="session-rename-title">
         <header className="small-dialog-header"><div><span className="project-dialog-icon"><PencilSimple size={18} /></span><div><h2 id="session-rename-title">重命名 Session</h2><p>{target.project?.name || "当前项目"}</p></div></div><button className="icon-button" onClick={onClose} title="关闭"><X size={18} /></button></header>
         <form className="small-dialog-form" onSubmit={submit}>
@@ -507,7 +544,7 @@ function SessionRenameDialog({ target, onClose, onSave, busy, error }) {
           <div className="small-dialog-actions"><button type="button" className="button-quiet" onClick={onClose}>取消</button><button type="submit" className="button-primary" disabled={busy || !name.trim()}>{busy ? "保存中…" : "保存名称"}</button></div>
         </form>
       </section>
-    </div>
+    </Modal>
   );
 }
 
@@ -562,7 +599,7 @@ function CurrentProjectDialog({
   };
 
   return (
-    <div className="modal-backdrop" role="presentation">
+    <Modal onClose={onClose}>
       <section className="project-dialog current-project-dialog" role="dialog" aria-modal="true" aria-labelledby="project-dialog-title">
         <header className="project-dialog-header">
           <div><span className="project-dialog-icon"><FolderOpen size={19} /></span><div><h2 id="project-dialog-title">当前项目设置</h2><p>只修改当前项目、Session 和项目级运行设置</p></div></div>
@@ -631,7 +668,7 @@ function CurrentProjectDialog({
                   </div>
                 </div>
                 {archivedSessions.length > 0 && <div className="project-section">
-                  <div className="project-section-title"><strong>已归档 Sessions</strong><span>归档只隐藏记录，不删除 Pi JSONL</span></div>
+                  <div className="project-section-title"><strong>已归档 Sessions</strong><span>归档只隐藏记录，不删除会话 JSONL</span></div>
                   <div className="session-list">
                     {archivedSessions.map((session) => (
                       <div className="session-row is-archived" key={session.sessionId}>
@@ -647,7 +684,7 @@ function CurrentProjectDialog({
           </div>
         </div>
       </section>
-    </div>
+    </Modal>
   );
 }
 
@@ -682,7 +719,7 @@ function SkillConfirmDialog({ action, skill, busy, autoReload, onClose, onConfir
   if (!skill || !action) return null;
   const removing = action === "remove";
   return (
-    <div className="modal-backdrop" role="presentation">
+    <Modal onClose={() => !busy && onClose()}>
       <section className="skill-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="skill-confirm-title">
         <div className={`skill-confirm-icon ${removing ? "is-danger" : ""}`}>
           {removing ? <Trash size={19} /> : <PuzzlePiece size={19} />}
@@ -690,13 +727,13 @@ function SkillConfirmDialog({ action, skill, busy, autoReload, onClose, onConfir
         <div className="skill-confirm-copy">
           <h2 id="skill-confirm-title">{removing ? "卸载工作区 Skill" : "安装到当前工作区"}</h2>
           <p>{removing
-            ? `将删除 .pi/skills/${skill.name}。只会移除由 Pi Desktop 安装的文件。`
-            : `将 ${skill.title} 复制到当前工作区${autoReload ? "，并重新加载 Pi 会话" : ""}。`}</p>
+            ? `将删除 .pi/skills/${skill.name}。只会移除由 Agentx 安装的文件。`
+            : `将 ${skill.title} 复制到当前工作区${autoReload ? "，并重新加载 Agentx 会话" : ""}。`}</p>
         </div>
         <div className="skill-confirm-summary">
           <div><span>Skill</span><code>{skill.name}</code></div>
           <div><span>文件</span><code>{skill.fileCount || skill.files?.length || 1} 个 · {formatBytes(skill.totalBytes)}</code></div>
-          <div><span>来源</span><code>{skill.sourceType === "bundled" ? "Pi Desktop 内置目录" : skill.sourcePath}</code></div>
+          <div><span>来源</span><code>{skill.sourceType === "bundled" ? "Agentx 内置目录" : skill.sourcePath}</code></div>
         </div>
         <div className="skill-confirm-actions">
           <button type="button" className="button-quiet" onClick={onClose} disabled={busy}>取消</button>
@@ -705,7 +742,7 @@ function SkillConfirmDialog({ action, skill, busy, autoReload, onClose, onConfir
           </button>
         </div>
       </section>
-    </div>
+    </Modal>
   );
 }
 
@@ -811,7 +848,7 @@ function SkillsPage({ transport, connected, workspace, embedded = false, autoRel
     try {
       const result = await transport.reloadSkills();
       updateResult(result, selected?.name);
-      setNotice("Pi Skills 已重新加载");
+      setNotice("Agentx Skills 已重新加载");
     } catch (reloadError) {
       setError(reloadError.message || "无法重新加载 Skills");
     } finally {
@@ -837,7 +874,7 @@ function SkillsPage({ transport, connected, workspace, embedded = false, autoRel
           <p>{workspace?.cwd || "当前工作区"}</p>
         </div>
         <div className="skills-header-actions">
-          <button className="skills-icon-button" onClick={reload} disabled={busy} title="重新加载 Pi Skills" aria-label="重新加载 Pi Skills">
+          <button className="skills-icon-button" onClick={reload} disabled={busy} title="重新加载 Agentx Skills" aria-label="重新加载 Agentx Skills">
             <ArrowsClockwise size={17} className={busy ? "spin" : ""} />
           </button>
           <button className="skills-import-button" onClick={importLocal} disabled={busy || !allowLocalImport} title={allowLocalImport ? "从本地导入 Skill" : "已在管理设置中禁止本地导入"}>
@@ -901,7 +938,7 @@ function SkillsPage({ transport, connected, workspace, embedded = false, autoRel
                   <div><h2>{selected.title}</h2><code>{selected.name}</code></div>
                 </div>
                 {selected.installed ? (
-                  <button className="skill-remove-button" onClick={() => setConfirm({ action: "remove", skill: selected })} disabled={!selected.managed || busy} title={selected.managed ? "卸载 Skill" : "此 Skill 不由 Pi Desktop 管理"}>
+                  <button className="skill-remove-button" onClick={() => setConfirm({ action: "remove", skill: selected })} disabled={!selected.managed || busy} title={selected.managed ? "卸载 Skill" : "此 Skill 不由 Agentx 管理"}>
                     <Trash size={16} />卸载
                   </button>
                 ) : (
@@ -947,7 +984,7 @@ function patchForFile(patch, fileName) {
   return sections.find((section) => section.includes(` b/${fileName}`)) || "该文件暂无可展示的文本补丁。";
 }
 
-function ReviewPanel({ onClose, snapshot, onRefresh }) {
+function ReviewPanel({ snapshot, onRefresh, onOpenFile }) {
   const files = snapshot ? snapshot.files : changedFiles;
   const [selectedFile, setSelectedFile] = useState(files[0]?.name || "");
   useEffect(() => {
@@ -956,13 +993,13 @@ function ReviewPanel({ onClose, snapshot, onRefresh }) {
   const selectedPatch = snapshot ? patchForFile(snapshot.patch, selectedFile) : null;
 
   return (
-    <aside className="review-panel">
+    <div className="diff-panel">
       <div className="review-header">
         <div>
           <strong>工作区变更</strong>
           <span>{files.length} 个文件</span>
         </div>
-        <button className="icon-button" onClick={onClose} title="关闭审查"><X size={18} /></button>
+        <button className="icon-button" disabled={!selectedFile} onClick={() => onOpenFile(selectedFile)} title="预览选中文件" aria-label="预览选中文件"><FileText size={17} /></button>
       </div>
       <div className="review-toolbar">
         <button onClick={onRefresh}><ArrowCounterClockwise size={15} />刷新</button>
@@ -998,14 +1035,14 @@ function ReviewPanel({ onClose, snapshot, onRefresh }) {
           </pre>
         )}
       </div>
-    </aside>
+    </div>
   );
 }
 
 function ApprovalDialog({ approval, onDecision }) {
   if (!approval) return null;
   return (
-    <div className="modal-backdrop" role="presentation">
+    <Modal onClose={() => onDecision(false)}>
       <section className="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-title">
         <div className="approval-icon"><ShieldCheck size={22} weight="fill" /></div>
         <div className="approval-copy">
@@ -1016,14 +1053,14 @@ function ApprovalDialog({ approval, onDecision }) {
           <div><TerminalWindow size={15} /><span>{approval.cwd}</span></div>
           <code>{approval.command}</code>
         </div>
-        <p className="approval-note">Pi 将以当前用户权限运行此命令。请只允许你理解并信任的操作。</p>
+        <p className="approval-note">Agentx 将以当前用户权限运行此命令。请只允许你理解并信任的操作。</p>
         <div className="approval-actions">
           <button className="button-quiet" onClick={() => onDecision(false)}>拒绝</button>
           <button className="button-secondary" onClick={() => onDecision(true)}>本次允许</button>
           <button className="button-primary" onClick={() => onDecision(true, true)}>始终允许测试</button>
         </div>
       </section>
-    </div>
+    </Modal>
   );
 }
 
@@ -1055,21 +1092,21 @@ function SettingsDialog({ open, settings, loading, saving, error, onClose, onSav
   };
 
   return (
-    <div className="modal-backdrop" role="presentation">
+    <Modal onClose={() => !saving && onClose()}>
       <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <div className="settings-header">
           <div>
             <span className="settings-icon"><GearSix size={19} /></span>
             <div>
               <h2 id="settings-title">模型设置</h2>
-              <p>配置 Pi Agent 使用的模型服务</p>
+              <p>配置 Agentx 使用的模型服务</p>
             </div>
           </div>
           <button className="icon-button" onClick={onClose} title="关闭设置"><X size={18} /></button>
         </div>
 
         {loading ? (
-          <div className="settings-loading"><CircleNotch size={18} className="spin" />正在读取 Pi 配置</div>
+          <div className="settings-loading"><CircleNotch size={18} className="spin" />正在读取 Agentx 配置</div>
         ) : (
           <form className="settings-form" onSubmit={(event) => {
             event.preventDefault();
@@ -1141,7 +1178,7 @@ function SettingsDialog({ open, settings, loading, saving, error, onClose, onSav
           </form>
         )}
       </section>
-    </div>
+    </Modal>
   );
 }
 
@@ -1150,6 +1187,7 @@ function SettingsPage({
   modelSettings,
   desktopSettings,
   toolCatalog,
+  availableModels,
   loading,
   saving,
   error,
@@ -1167,6 +1205,18 @@ function SettingsPage({
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [defaultRoot, setDefaultRoot] = useState("");
+  const [providerOperation, setProviderOperation] = useState(null);
+  const [remoteCatalog, setRemoteCatalog] = useState(null);
+  const [catalogSearch, setCatalogSearch] = useState("");
+  const providerRequestVersion = useRef(0);
+
+  useEffect(() => {
+    providerRequestVersion.current += 1;
+    setProviderOperation(null);
+    setRemoteCatalog(null);
+    setCatalogSearch("");
+    return () => { providerRequestVersion.current += 1; };
+  }, [providerId, baseUrl, apiKey, modelSettings]);
 
   useEffect(() => {
     if (!modelSettings?.providers?.length) return;
@@ -1183,6 +1233,22 @@ function SettingsPage({
   }, [desktopSettings?.defaultProjectRoot]);
 
   const provider = modelSettings?.providers?.find((item) => item.id === providerId);
+  const providerBusy = providerOperation?.busy;
+  const remoteSelectable = remoteCatalog?.models.filter((item) => item.selectable) || [];
+  const visibleRemoteModels = remoteCatalog?.models.filter((item) => `${item.id} ${item.name}`.toLowerCase().includes(catalogSearch.trim().toLowerCase())) || [];
+  const runProviderCheck = async (kind) => {
+    const version = ++providerRequestVersion.current;
+    setProviderOperation({ kind, busy: true });
+    try {
+      const result = await transport[kind]({ providerId, modelId, baseUrl, apiKey });
+      if (version !== providerRequestVersion.current) return;
+      setProviderOperation({ kind, ...result, busy: false });
+      if (kind === "fetchProviderModels" && result.ok) setRemoteCatalog(result);
+    } catch (error) {
+      if (version === providerRequestVersion.current) setProviderOperation({ kind, busy: false, ok: false,
+        error: { message: "供应商操作失败，请检查 Agent Host 连接后重试。" } });
+    }
+  };
   const configuredProviders = (modelSettings?.providers || []).filter((item) => item.configured);
   const unconfiguredProviders = (modelSettings?.providers || []).filter((item) => !item.configured);
   const authSourceLabels = { stored: "本地凭据", environment: "环境变量", runtime: "临时凭据" };
@@ -1206,7 +1272,7 @@ function SettingsPage({
     { id: "skills", label: "Skills", icon: PuzzlePiece, hint: "来源与工作区安装" },
     { id: "defaults", label: "新项目默认值", icon: FolderOpen, hint: "新项目继承的设置" },
     { id: "storage", label: "存储与会话", icon: Package, hint: "配置文件与运行数据" },
-    { id: "diagnostics", label: "运行与诊断", icon: ArrowsClockwise, hint: "连接状态与版本信息" },
+    { id: "diagnostics", label: "运行与诊断", icon: ArrowsClockwise, hint: "本地配置与故障排查" },
   ];
 
   const saveRoot = async () => {
@@ -1223,9 +1289,8 @@ function SettingsPage({
       <header className="settings-page-header">
         <div>
           <span className="settings-page-icon"><GearSix size={21} /></span>
-          <div><h1>管理</h1><p>集中管理 Pi Agent Desktop 的配置与运行偏好</p></div>
+          <div><h1>管理</h1><p>集中管理 Agentx 的配置与运行偏好</p></div>
         </div>
-        <div className="settings-page-status"><span className={`online-dot ${runtime.connected ? "" : "is-offline"}`} />{runtime.connected ? "Agent Host 已连接" : "等待工作区"}</div>
       </header>
       <div className="settings-page-body">
         <nav className="settings-nav" aria-label="设置分类">
@@ -1246,14 +1311,26 @@ function SettingsPage({
                 <div className="settings-inline-actions"><span>当前值会保存到 Desktop 的用户配置，不会写入项目目录。</span><button className="button-primary" onClick={saveRoot} disabled={saving || !defaultRoot.trim()}><Check size={14} />保存目录</button></div>
               </section>
               <section className="settings-block settings-option-row"><div><strong>启动时恢复上次工作区</strong><span>应用启动后自动打开最近一次项目和 Session。</span></div><input className="settings-switch" type="checkbox" checked={desktopSettings?.reopenLastWorkspace !== false} onChange={(event) => onSaveDesktop({ reopenLastWorkspace: event.target.checked })} /></section>
+              <section className="settings-block settings-system-info" aria-label="系统信息">
+                <div className="settings-block-heading"><div><strong>系统信息</strong><span>当前运行环境与服务连接状态</span></div></div>
+                <dl className="settings-system-grid">
+                  <div><dt>运行环境</dt><dd>{desktopMode ? "本地 Desktop" : "浏览器演示（Mock）"}</dd></div>
+                  <div><dt>Agent Host</dt><dd className={runtime.connected ? "is-good" : ""}><span className={`online-dot ${runtime.connected ? "" : "is-offline"}`} />{runtime.connected ? (desktopMode ? "已连接" : "模拟连接") : "未连接"}</dd></div>
+                  <div><dt>连接方式</dt><dd>{desktopMode ? "Electron IPC · Pi SDK" : "浏览器 Mock"}</dd></div>
+                  <div><dt>可用模型</dt><dd>{desktopMode ? `${availableModels.length} 个` : "演示数据"}</dd></div>
+                  <div><dt>模型认证</dt><dd>{desktopMode ? (runtime.authenticated ? "已配置" : "未配置") : "演示模式，不读取本机凭据"}</dd></div>
+                  <div><dt>后台服务</dt><dd>未接入</dd></div>
+                </dl>
+                {runtime.message && <p className="settings-system-note">{runtime.message}</p>}
+              </section>
               {error && <div className="settings-error"><WarningCircle size={15} weight="fill" />{error}</div>}
             </div>
           )}
 
           {section === "models" && (
             <div className="settings-section-stack">
-              <div className="settings-content-heading"><div><h2>模型与服务</h2><p>配置 Pi Agent 使用的 Provider、模型、Base URL 和 API Key。</p></div></div>
-              {loading ? <div className="settings-loading"><CircleNotch size={18} className="spin" />正在读取 Pi 配置</div> : (
+              <div className="settings-content-heading"><div><h2>模型与服务</h2><p>配置 Agentx 使用的 Provider、模型、Base URL 和 API Key。</p></div></div>
+              {loading ? <div className="settings-loading"><CircleNotch size={18} className="spin" />正在读取 Agentx 配置</div> : (
                 <>
                 <section className="settings-block" aria-label="已配置供应商">
                   <div className="settings-block-heading">
@@ -1276,12 +1353,44 @@ function SettingsPage({
                   <p className="settings-provider-note">认证可能来自 API Key、环境变量或登录凭据；不显示密钥内容。</p>
                 </section>
                 <form className="settings-block settings-model-form" onSubmit={saveModel}>
-                  <div className="settings-grid"><label className="field-control"><span>Provider</span><select value={providerId} onChange={(event) => changeProvider(event.target.value)}>{configuredProviders.length > 0 && <optgroup label="已配置">{configuredProviders.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.id}) · 已配置</option>)}</optgroup>}{unconfiguredProviders.length > 0 && <optgroup label="未配置">{unconfiguredProviders.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.id})</option>)}</optgroup>}</select></label><label className="field-control"><span>模型</span><select value={modelId} onChange={(event) => setModelId(event.target.value)}>{(provider?.models || []).map((item) => <option key={item.id} value={item.id}>{item.name || item.id}</option>)}</select></label></div>
+                  <div className="settings-grid"><label className="field-control"><span>Provider</span><select value={providerId} onChange={(event) => changeProvider(event.target.value)}>{configuredProviders.length > 0 && <optgroup label="已配置">{configuredProviders.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.id}) · 已配置</option>)}</optgroup>}{unconfiguredProviders.length > 0 && <optgroup label="未配置">{unconfiguredProviders.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.id})</option>)}</optgroup>}</select></label><label className="field-control"><span>模型</span><select value={modelId} disabled={providerBusy} onChange={(event) => { setModelId(event.target.value); if (providerOperation?.kind === "testModelSettings") setProviderOperation(null); }}>
+                    {remoteCatalog ? <>
+                      {modelId && !remoteSelectable.some((item) => item.id === modelId) && <option value={modelId}>{provider?.models.find((item) => item.id === modelId)?.name || modelId} · 远端未列出</option>}
+                      {!remoteSelectable.length && !modelId && <option value="">没有匹配的对话模型</option>}
+                      <optgroup label="供应商返回 · Agentx 已支持">{remoteSelectable.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>
+                    </> : (provider?.models || []).map((item) => <option key={item.id} value={item.id}>{item.name || item.id}</option>)}
+                  </select><small>{remoteCatalog ? "当前显示远端列表中 Agentx 已适配的对话模型。" : "当前使用内置模型目录，可向供应商获取实时列表。"}</small></label></div>
                   <label className="field-control"><span>Base URL</span><input type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={provider?.defaultBaseUrl || "https://api.example.com/v1"} spellCheck="false" /><small>留空时使用 Provider 默认地址；填写后保存到 models.json。</small></label>
                   <label className="field-control"><span>API Key</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={provider?.configured ? "已配置，留空保持不变" : "输入 API Key"} autoComplete="off" disabled={!provider?.apiKeySupported} /><small>密钥由 Pi SDK 写入 auth.json，不会写入项目配置或页面存储。</small></label>
+                  <div className="settings-provider-tools">
+                    <button type="button" className="button-secondary" disabled={saving || providerBusy || !providerId || !modelId} onClick={() => runProviderCheck("testModelSettings")}>
+                      {providerBusy && providerOperation.kind === "testModelSettings" ? <CircleNotch size={14} className="spin" /> : <CheckCircle size={14} />}测试当前模型
+                    </button>
+                    <button type="button" className="button-secondary" disabled={saving || providerBusy || !providerId || provider?.discovery?.supported === false} title={provider?.discovery?.reason || "直接向供应商获取模型列表"} onClick={() => runProviderCheck("fetchProviderModels")}>
+                      <ArrowsClockwise size={14} className={providerBusy && providerOperation.kind === "fetchProviderModels" ? "spin" : ""} />获取供应商模型
+                    </button>
+                    {remoteCatalog && <button type="button" className="button-secondary" disabled={providerBusy} onClick={() => { setRemoteCatalog(null); setProviderOperation(null); }}>恢复内置目录</button>}
+                  </div>
+                  <p className="settings-muted-note">测试使用当前表单配置，不自动保存；API Key 留空时使用已有认证。测试会发送一条简短请求，可能产生少量费用，不发送聊天内容或调用工具。</p>
+                  {provider?.discovery?.supported === false && <p className="settings-muted-note">{provider.discovery.reason}</p>}
+                  {providerOperation?.busy && <div className="settings-provider-result" role="status">正在{providerOperation.kind === "testModelSettings" ? "测试当前模型" : "读取供应商模型列表"}…</div>}
+                  {providerOperation && !providerOperation.busy && <div className={`settings-provider-result ${providerOperation.ok ? "is-success" : "is-error"}`} role={providerOperation.ok ? "status" : "alert"}>
+                    <span>{providerOperation.ok ? providerOperation.message : providerOperation.error?.message}{providerOperation.ok && providerOperation.elapsedMs !== undefined ? `（${(providerOperation.elapsedMs / 1000).toFixed(1)} 秒）` : ""}</span>
+                    {!providerOperation.ok && providerOperation.error?.details && <details><summary>查看详情</summary><pre>{providerOperation.error.details}</pre></details>}
+                  </div>}
+                  {remoteCatalog && <section className="settings-remote-models" aria-label="供应商实时模型列表">
+                    <div className="settings-block-heading"><div><strong>供应商模型 · {remoteCatalog.models.length}</strong><span>可直接选择 {remoteSelectable.length} 个 · 获取于 {new Date(remoteCatalog.fetchedAt).toLocaleTimeString()}</span></div></div>
+                    <input aria-label="搜索供应商模型" placeholder="搜索模型名称或 ID" value={catalogSearch} onChange={(event) => setCatalogSearch(event.target.value)} />
+                    <div className="settings-remote-model-list">
+                      {visibleRemoteModels.length ? visibleRemoteModels.map((item) => <button key={item.id} type="button" disabled={!item.selectable || providerBusy} aria-pressed={modelId === item.id} onClick={() => { setModelId(item.id); if (providerOperation?.kind === "testModelSettings") setProviderOperation(null); }}>
+                        <span><strong>{item.name}</strong><code>{item.id}</code></span><small>{item.reason}</small>
+                      </button>) : <p className="settings-muted-note">没有匹配的模型。</p>}
+                    </div>
+                    <small className="settings-muted-note">保留供应商返回的全部条目；未收录或非对话模型仅供查看。视觉、推理和上下文能力继续以 Pi 适配信息为准，模型可见不保证有调用权限或额度。</small>
+                  </section>}
                   {error && <div className="settings-error"><WarningCircle size={15} weight="fill" />{error}</div>}
                   <div className="settings-files"><div><span>Pi 设置</span><code>{modelSettings?.paths?.settings || "~/.pi/agent/settings.json"}</code></div><div><span>服务配置</span><code>{modelSettings?.paths?.models || "~/.pi/agent/models.json"}</code></div><div><span>认证凭据</span><code>{modelSettings?.paths?.auth || "~/.pi/agent/auth.json"}</code></div></div>
-                  <div className="settings-actions">{provider?.configured && <button type="button" className="button-danger-quiet" onClick={() => onClearCredential(providerId)} disabled={saving}>清除凭据</button>}<span /><button type="submit" className="button-primary" disabled={saving || !providerId || !modelId}>{saving ? <><CircleNotch size={14} className="spin" />正在保存</> : <><Check size={14} />保存并使用</>}</button></div>
+                  <div className="settings-actions">{provider?.configured && <button type="button" className="button-danger-quiet" onClick={() => onClearCredential(providerId)} disabled={saving || providerBusy}>清除凭据</button>}<span /><button type="submit" className="button-primary" disabled={saving || providerBusy || !providerId || !modelId}>{saving ? <><CircleNotch size={14} className="spin" />正在保存</> : <><Check size={14} />保存并使用</>}</button></div>
                 </form>
                 </>
               )}
@@ -1289,13 +1398,13 @@ function SettingsPage({
           )}
 
           {section === "agent" && (
-            <div className="settings-section-stack"><div className="settings-content-heading"><div><h2>Agent 与权限</h2><p>这是新项目和新 Session 的默认执行策略，项目设置可以覆盖它。</p></div></div><section className="settings-block"><label className="field-control"><span>默认权限模式</span><select value={desktopSettings?.defaultPermissionMode || "ask"} onChange={(event) => onSaveDesktop({ defaultPermissionMode: event.target.value })}><option value="read-only">只读</option><option value="ask">执行前询问</option><option value="full">完全访问</option></select><small>权限判断仍在 Agent Host 执行，页面只负责展示和收集审批。</small></label></section><section className="settings-block settings-info-row"><ShieldCheck size={20} /><div><strong>当前运行状态</strong><span>{runtime.message || (runtime.connected ? "Agent Host 已连接" : "尚未连接工作区")}</span></div></section></div>
+            <div className="settings-section-stack"><div className="settings-content-heading"><div><h2>Agent 与权限</h2><p>这是新项目和新 Session 的默认执行策略，项目设置可以覆盖它。</p></div></div><section className="settings-block"><label className="field-control"><span>默认权限模式</span><select value={desktopSettings?.defaultPermissionMode || "ask"} onChange={(event) => onSaveDesktop({ defaultPermissionMode: event.target.value })}><option value="read-only">只读</option><option value="ask">执行前询问</option><option value="full">完全访问</option></select><small>权限判断仍在 Agent Host 执行，页面只负责展示和收集审批。</small></label></section></div>
           )}
 
           {section === "tools" && (
             <div className="settings-section-stack is-wide">
               <div className="settings-content-heading">
-                <div><h2>Tools</h2><p>控制 Pi Agent 默认可调用的本地能力；项目可以单独覆盖。</p></div>
+                <div><h2>Tools</h2><p>控制 Agentx 默认可调用的本地能力；项目可以单独覆盖。</p></div>
                 <span className="tool-count">{enabledToolIds.length} / {toolCatalog.length} 已启用</span>
               </div>
               <section className="settings-block tool-catalog-block">
@@ -1316,7 +1425,7 @@ function SettingsPage({
             <div className="settings-section-stack is-wide">
               <div className="settings-content-heading"><div><h2>Skills</h2><p>全局行为和当前项目的 Skills 安装统一在这里管理。</p></div></div>
               <div className="settings-skills-options">
-                <section className="settings-block settings-option-row"><div><strong>安装后自动重新加载</strong><span>Skill 安装或卸载完成后刷新当前 Pi Session。</span></div><input className="settings-switch" type="checkbox" checked={desktopSettings?.skills?.autoReload !== false} onChange={(event) => onSaveDesktop({ skills: { autoReload: event.target.checked } })} /></section>
+                <section className="settings-block settings-option-row"><div><strong>安装后自动重新加载</strong><span>Skill 安装或卸载完成后刷新当前 Agentx Session。</span></div><input className="settings-switch" type="checkbox" checked={desktopSettings?.skills?.autoReload !== false} onChange={(event) => onSaveDesktop({ skills: { autoReload: event.target.checked } })} /></section>
                 <section className="settings-block settings-option-row"><div><strong>允许导入本地 Skill</strong><span>允许从本机选择包含 SKILL.md 的目录。</span></div><input className="settings-switch" type="checkbox" checked={desktopSettings?.skills?.allowLocalImport !== false} onChange={(event) => onSaveDesktop({ skills: { allowLocalImport: event.target.checked } })} /></section>
               </div>
               <SkillsPage
@@ -1339,7 +1448,7 @@ function SettingsPage({
           )}
 
           {section === "diagnostics" && (
-            <div className="settings-section-stack"><div className="settings-content-heading"><div><h2>运行与诊断</h2><p>快速确认本地 Agent Host 和 Pi 连接状态。</p></div></div><section className="settings-block settings-diagnostic-grid"><div><span>Agent Host</span><strong className={runtime.connected ? "is-good" : ""}>{runtime.connected ? "已连接" : "未连接"}</strong></div><div><span>认证状态</span><strong className={runtime.authenticated ? "is-good" : ""}>{runtime.authenticated ? "已配置" : "未配置"}</strong></div><div><span>当前工作区</span><strong>{workspace?.repo || "未选择"}</strong></div><div><span>当前模型</span><strong>{modelSettings?.currentModel?.name || "未选择"}</strong></div></section><section className="settings-block settings-info-row"><ArrowsClockwise size={20} /><div><strong>重新读取模型配置</strong><span>模型设置保存后会通过 Agent Host 重新加载 Provider。</span></div><button className="button-secondary" onClick={onReloadModels}>重新读取</button></section></div>
+            <div className="settings-section-stack"><div className="settings-content-heading"><div><h2>运行与诊断</h2><p>重新读取本地配置并排查运行问题。</p></div></div><section className="settings-block settings-info-row"><Cpu size={20} /><div><strong>系统连接状态</strong><span>运行环境与服务连接信息统一显示在通用页面。</span></div><button className="button-secondary" onClick={() => setSection("general")}>查看系统信息</button></section><section className="settings-block settings-info-row"><ArrowsClockwise size={20} /><div><strong>重新读取模型配置</strong><span>模型设置保存后会通过 Agent Host 重新加载 Provider。</span></div><button className="button-secondary" onClick={onReloadModels}>重新读取</button></section></div>
           )}
         </div>
       </div>
@@ -1353,7 +1462,6 @@ function modelValue(model) {
 
 export function App() {
   const transportRef = useRef(null);
-  const threadEndRef = useRef(null);
   const [tasks, setTasks] = useState(() => desktopMode
     ? [{ id: "workspace", title: "选择工作目录", repo: "未连接", branch: "-", time: "现在", status: "idle" }]
     : initialTasks);
@@ -1363,9 +1471,18 @@ export function App() {
   const [attachments, setAttachments] = useState([]);
   const [attachmentError, setAttachmentError] = useState("");
   const [attachmentPickerBusy, setAttachmentPickerBusy] = useState(false);
-  const [running, setRunning] = useState(false);
+  const [runningSessions, setRunningSessions] = useState({});
+  const running = Boolean(runningSessions[activeTaskId]);
+  const activeSessionRef = useRef(activeTaskId);
+  activeSessionRef.current = activeTaskId;
+  const pendingApprovals = useRef(new Map());
+  const panelStateCache = useRef(new Map());
+  const panelOpenCache = useRef(new Map());
   const [approval, setApproval] = useState(null);
   const [reviewOpen, setReviewOpen] = useState(() => window.innerWidth >= 1120);
+  const [previewRequest, setPreviewRequest] = useState(null);
+  const openPreview = useCallback((path = null) => { setPreviewRequest({ path, sequence: Date.now() }); setReviewOpen(true); }, []);
+  const openWebPreview = useCallback((url) => { setPreviewRequest({ url, sequence: Date.now() }); setReviewOpen(true); }, []);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [activeView, setActiveView] = useState("conversation");
   const [model, setModel] = useState(desktopMode ? null : { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" });
@@ -1389,9 +1506,14 @@ export function App() {
   const [renameSessionTarget, setRenameSessionTarget] = useState(null);
   const [renameSessionBusy, setRenameSessionBusy] = useState(false);
   const [renameSessionError, setRenameSessionError] = useState("");
-  const [changeSnapshot, setChangeSnapshot] = useState(() => desktopMode ? { files: [], additions: 0, deletions: 0, patch: "" } : null);
+  const [changeSnapshots, setChangeSnapshots] = useState({});
+  const changeSnapshot = changeSnapshots[activeTaskId] || (desktopMode ? { files: [], additions: 0, deletions: 0, patch: "" } : null);
+  const setChangeSnapshot = (snapshot, sessionId = activeSessionRef.current) => setChangeSnapshots((current) => ({ ...current, [sessionId]: snapshot }));
   const activeTask = useMemo(() => tasks.find((task) => task.id === activeTaskId) || tasks[0], [tasks, activeTaskId]);
   const messages = sessions[activeTaskId] || [];
+  const threadScroll = useThreadScroll({ sessionId: activeTaskId, messages, running, visible: activeView === "conversation" });
+  const currentProject = projects.find((item) => item.id === activeProjectId);
+  const currentSession = currentProject?.sessions?.find((item) => item.sessionId === activeTaskId);
   const supportsImages = !desktopMode || model?.input?.includes("image");
   const hasUnsupportedImage = attachments.some((attachment) => attachment.kind === "image") && !supportsImages;
 
@@ -1400,21 +1522,24 @@ export function App() {
     setAttachmentError("");
   }, [activeTaskId]);
 
+  useEffect(() => { panelOpenCache.current.set(activeTaskId, reviewOpen); }, [activeTaskId, reviewOpen]);
+
   useEffect(() => {
     const transport = createTransport();
     transportRef.current = transport;
     transport.getDesktopSettings?.().then((settings) => {
       setDesktopSettings(settings);
       const permissionLabels = { "read-only": "只读", ask: "执行前询问", full: "完全访问" };
-      if (settings?.defaultPermissionMode) setPermission(permissionLabels[settings.defaultPermissionMode] || "执行前询问");
+      if (settings?.defaultPermissionMode && activeSessionRef.current === "workspace") setPermission(permissionLabels[settings.defaultPermissionMode] || "执行前询问");
     }).catch(() => {});
     transport.listTools?.().then((result) => setToolCatalog(result?.tools || [])).catch(() => {});
     transport.listProjects?.().then((items) => {
       setProjects(items || []);
       if (items?.[0]) setActiveProjectId(items[0].id);
     }).catch(() => {});
-    const unsubscribe = transport.subscribe((event) => {
+    const handleEvent = (event) => {
       if (event.type === "workspace.connected") {
+        activeSessionRef.current = event.sessionId;
         setActiveProjectId(event.projectId || null);
         const task = {
           id: event.sessionId,
@@ -1423,33 +1548,41 @@ export function App() {
           branch: event.branch || "workspace",
           cwd: event.cwd,
           time: "刚刚",
-          status: "idle",
+          status: event.running ? "running" : "idle",
         };
-        setTasks([task]);
-        setSessions({ [event.sessionId]: event.messages || [] });
+        setTasks((current) => [task, ...current.filter((item) => item.id !== event.sessionId)]);
+        setSessions((current) => ({ ...current, [event.sessionId]: event.running && current[event.sessionId] ? current[event.sessionId] : event.messages || [] }));
         setActiveTaskId(event.sessionId);
+        setRunningSessions((current) => ({ ...current, [event.sessionId]: Boolean(event.running) }));
+        setPermission(({ "read-only": "只读", ask: "执行前询问", full: "完全访问" })[event.permissionMode] || "执行前询问");
+        setApproval(event.pendingApprovals?.[0] || pendingApprovals.current.get(event.sessionId) || null);
+        setInput("");
+        setPreviewRequest(null);
+        setReviewOpen(panelOpenCache.current.get(event.sessionId) ?? false);
         setAvailableModels(event.availableModels || []);
         setModel(event.model || null);
-        setChangeSnapshot({ files: [], additions: 0, deletions: 0, patch: "" });
+        setRuntime({ connected: true, authenticated: Boolean(event.authenticated), message: event.authenticated ? "Agentx 已就绪" : "Agentx 已连接，但尚未配置模型凭据" });
         setRuntimeError("");
         transport.listSessions?.({ cwd: event.cwd, projectId: event.projectId }).then((result) => setProjectSessions(result?.sessions || [])).catch(() => {});
         transport.listProjects?.().then((items) => setProjects(items || [])).catch(() => {});
       }
+      if (event.type === "projects.updated") setProjects(event.projects || []);
+      const isCurrent = !event.sessionId || event.sessionId === activeSessionRef.current;
       if (event.type === "runtime.status") {
-        setRuntime({ connected: event.connected, authenticated: event.authenticated, message: event.message });
+        if (isCurrent) setRuntime({ connected: event.connected, authenticated: event.authenticated, message: event.message });
       }
-      if (event.type === "models.updated") {
+      if (event.type === "models.updated" && isCurrent) {
         setModel(event.model || null);
         setAvailableModels(event.availableModels || []);
         setRuntime((current) => ({ ...current, authenticated: event.authenticated }));
         setRuntimeError("");
       }
-      if (event.type === "runtime.error") {
-        setRuntimeError(event.message || "Pi Agent 运行失败");
+      if (event.type === "runtime.error" && isCurrent) {
+        setRuntimeError(event.message || "Agentx 运行失败");
       }
       if (event.type === "run.started") {
-        setRunning(true);
-        setRuntimeError("");
+        setRunningSessions((current) => ({ ...current, [event.sessionId]: true }));
+        if (isCurrent) setRuntimeError("");
         setTasks((current) => current.map((task) => task.id === event.sessionId ? { ...task, status: "running", time: "进行中" } : task));
       }
       if (event.type === "message.started") {
@@ -1499,7 +1632,14 @@ export function App() {
           } : message),
         }));
       }
-      if (event.type === "approval.requested") setApproval(event);
+      if (event.type === "approval.requested") {
+        pendingApprovals.current.set(event.sessionId, event);
+        if (isCurrent) setApproval(event);
+      }
+      if (event.type === "approval.resolved") {
+        pendingApprovals.current.delete(event.sessionId);
+        if (isCurrent) setApproval(null);
+      }
       if (event.type === "tool.started") {
         setSessions((current) => {
           const list = [...(current[event.sessionId] || [])];
@@ -1526,7 +1666,7 @@ export function App() {
       }
       if (event.type === "changes.available") {
         const files = Array.isArray(event.files) ? event.files : [];
-        setChangeSnapshot({ files, additions: event.additions || 0, deletions: event.deletions || 0, patch: event.patch || "" });
+        setChangeSnapshot({ files, additions: event.additions || 0, deletions: event.deletions || 0, patch: event.patch || "" }, event.sessionId);
         setSessions((current) => {
           const list = [...(current[event.sessionId] || [])];
           if (!list.length) return current;
@@ -1536,8 +1676,9 @@ export function App() {
         });
       }
       if (event.type === "run.settled") {
-        setRunning(false);
-        setApproval(null);
+        setRunningSessions((current) => ({ ...current, [event.sessionId]: false }));
+        pendingApprovals.current.delete(event.sessionId);
+        if (isCurrent) setApproval(null);
         setTasks((current) => current.map((task) => task.id === event.sessionId ? { ...task, status: event.status === "error" ? "error" : "done", time: "刚刚" } : task));
         setSessions((current) => ({
           ...current,
@@ -1554,8 +1695,28 @@ export function App() {
           } : message),
         }));
       }
+    };
+    // Batch high-frequency output without losing event order or final tokens.
+    let pendingOutput = [];
+    let outputTimer;
+    const flushOutput = () => {
+      window.clearTimeout(outputTimer);
+      outputTimer = undefined;
+      const events = pendingOutput;
+      pendingOutput = [];
+      events.forEach(handleEvent);
+    };
+    const unsubscribe = transport.subscribe((event) => {
+      if (["message.delta", "reasoning.delta", "tool.progress"].includes(event.type)) {
+        pendingOutput.push(event);
+        outputTimer ??= window.setTimeout(flushOutput, 40);
+      } else {
+        flushOutput();
+        handleEvent(event);
+      }
     });
     return () => {
+      window.clearTimeout(outputTimer);
       unsubscribe();
       transport.dispose();
     };
@@ -1565,10 +1726,6 @@ export function App() {
     if (!desktopMode) return;
     transportRef.current?.restoreWorkspace().catch((error) => setRuntimeError(error.message));
   }, []);
-
-  useEffect(() => {
-    threadEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, approval]);
 
   const openWorkspace = async () => {
     if (!desktopMode) return;
@@ -1701,6 +1858,7 @@ export function App() {
       const result = await transportRef.current?.projectCommand({ type: "rename-session", projectId, sessionId: session.sessionId, sessionFile: session.sessionFile, name: name.trim() });
       if (result?.project) setProjects((current) => current.map((item) => item.id === projectId ? result.project : item));
       if (result?.sessions) setProjectSessions(result.sessions);
+      setTasks((current) => current.map((task) => task.id === session.sessionId ? { ...task, title: name.trim() } : task));
       return true;
     } catch (error) {
       setRuntimeError(error.message || "无法重命名 Session");
@@ -1729,7 +1887,7 @@ export function App() {
         setProjects((current) => current.map((item) => item.id === projectId ? updated : item));
         setProjectSessions((current) => current.map((item) => item.sessionId === session.sessionId ? { ...item, archived: true } : item));
       }
-    } catch (error) { setRuntimeError(error.message || "无法归档 Session"); }
+    } catch (error) { setRuntimeError(error.message || "无法归档 Session"); throw error; }
   };
 
   const restoreSession = async (projectId, session) => {
@@ -1766,6 +1924,7 @@ export function App() {
     setTasks((current) => [task, ...current]);
     setSessions((current) => ({ ...current, [id]: [] }));
     setActiveTaskId(id);
+    setPreviewRequest(null);
     setActiveView("conversation");
     setReviewOpen(false);
   };
@@ -1818,10 +1977,12 @@ export function App() {
     }
     const submittedAttachments = attachments;
     const displayText = text || "请阅读并处理所附文件。";
+    threadScroll.jumpToBottom();
     setInput("");
     setAttachments([]);
     setAttachmentError("");
-    setRunning(true);
+    const submittedSessionId = activeTaskId;
+    setRunningSessions((current) => ({ ...current, [submittedSessionId]: true }));
     setRuntimeError("");
     setSessions((current) => ({
       ...current,
@@ -1835,24 +1996,28 @@ export function App() {
       const nextProjects = await transportRef.current?.listProjects?.();
       if (nextProjects) setProjects(nextProjects);
     } catch (error) {
-      setRunning(false);
-      setInput(text);
-      setAttachments(submittedAttachments);
-      setRuntimeError(error.message || "任务执行失败");
+      setRunningSessions((current) => ({ ...current, [submittedSessionId]: false }));
+      if (activeSessionRef.current === submittedSessionId) {
+        setInput(text);
+        setAttachments(submittedAttachments);
+        setRuntimeError(error.message || "任务执行失败");
+      }
     }
   };
 
   const decideApproval = async (approved, remember = false) => {
     const requestId = approval?.requestId;
     setApproval(null);
-    await transportRef.current?.respondToApproval({ requestId, approved, remember });
+    const sessionId = approval?.sessionId;
+    pendingApprovals.current.delete(sessionId);
+    await transportRef.current?.respondToApproval({ requestId, sessionId, approved, remember });
   };
 
   const changePermission = async (value) => {
-    setPermission(value);
     const modes = { "只读": "read-only", "执行前询问": "ask", "完全访问": "full" };
     try {
-      await transportRef.current?.setPermissionMode(modes[value]);
+      await transportRef.current?.setPermissionMode(modes[value], activeTaskId);
+      if (activeSessionRef.current === activeTaskId) setPermission(value);
     } catch (error) {
       setRuntimeError(error.message || "无法更新权限模式");
     }
@@ -1860,17 +2025,20 @@ export function App() {
 
   const refreshChanges = async () => {
     try {
-      const snapshot = await transportRef.current?.getChanges();
-      if (snapshot) setChangeSnapshot(snapshot);
+      const sessionId = activeTaskId;
+      const snapshot = await transportRef.current?.getChanges(sessionId);
+      if (snapshot) setChangeSnapshot(snapshot, sessionId);
     } catch (error) {
       setRuntimeError(error.message || "无法读取工作区变更");
     }
   };
 
   const openSettings = async () => {
+    if (activeView === "management") {
+      setActiveView("conversation");
+      return;
+    }
     setActiveView("management");
-    setReviewOpen(false);
-    setApproval(null);
     setSettingsLoading(true);
     setSettingsError("");
     try {
@@ -1958,10 +2126,11 @@ export function App() {
     <div className="app-shell">
       <Sidebar
         tasks={tasks}
+        runningSessions={runningSessions}
         projects={projects.filter((item) => !item.removed)}
         activeProjectId={activeProjectId}
         activeTaskId={activeTaskId}
-        onSelect={(id) => { setActiveTaskId(id); setActiveView("conversation"); setApproval(null); }}
+        onSelect={(id) => { setActiveTaskId(id); setPreviewRequest(null); setReviewOpen(panelOpenCache.current.get(id) ?? false); setActiveView("conversation"); setApproval(null); }}
         onProjectSelect={(projectId) => { const project = projects.find((item) => item.id === projectId); setActiveProjectId(projectId); openProject(projectId, project?.lastSessionId); setActiveView("conversation"); setApproval(null); }}
         onSessionSelect={(project, session) => { setActiveProjectId(project.id); openSession(project.id, session); setApproval(null); }}
         onRenameSession={(project, session) => { setRenameSessionError(""); setRenameSessionTarget({ project, session }); }}
@@ -1983,6 +2152,7 @@ export function App() {
             modelSettings={modelSettings}
             desktopSettings={desktopSettings}
             toolCatalog={toolCatalog}
+            availableModels={availableModels}
             loading={settingsLoading}
             saving={settingsSaving}
             error={settingsError}
@@ -1994,20 +2164,29 @@ export function App() {
             onChooseProjectFolder={() => transportRef.current?.chooseProjectFolder?.()}
             onReloadModels={reloadModelSettings}
           />
-        ) : <>
+        ) : null}
+        <div className="conversation-view" hidden={activeView === "management"} onClickCapture={(event) => {
+          const link = event.target.closest?.("a[href]");
+          if (!link || !/^https?:\/\//i.test(link.getAttribute("href") || "")) return;
+          event.preventDefault(); event.stopPropagation(); openWebPreview(link.href);
+        }} onContextMenuCapture={(event) => {
+          const link = event.target.closest?.("a[href]");
+          if (!link || !/^https?:\/\//i.test(link.getAttribute("href") || "") || !window.piDesktop?.browser) return;
+          event.preventDefault();
+          window.piDesktop.browser({ type: "link-menu", url: link.href }).catch(() => {});
+        }}>
           <header className="workspace-header">
             <div className="task-heading">
-              <h1>{activeTask.title}</h1>
+              <h1>{currentSession?.title || activeTask.title}</h1>
               <button className="repo-chip" onClick={openWorkspace} title={activeTask.cwd || "选择工作目录"}><FolderOpen size={14} />{activeTask.repo}</button>
               <button className="repo-chip"><GitBranch size={14} />{activeTask.branch}</button>
             </div>
             <div className="header-actions">
-              <button className={`header-button ${reviewOpen ? "is-active" : ""}`} onClick={() => setReviewOpen((value) => !value)}>
-                <Columns size={17} />
-                <span>变更</span>
-                <span className="count-badge">{changeSnapshot?.files?.length ?? (desktopMode ? 0 : 6)}</span>
-              </button>
-              <button className="icon-button" title="更多操作"><DotsThree size={20} weight="bold" /></button>
+              <SessionActions transport={transportRef.current} sessionId={activeTaskId} session={currentSession} project={currentProject} projects={projects} running={running} demo={!desktopMode}
+                onRename={() => { setRenameSessionError(""); setRenameSessionTarget({ project: currentProject, session: currentSession }); }}
+                onImported={(result) => { setProjects((current) => current.map((item) => item.id === result.project.id ? result.project : item)); setInput(""); setActiveView("conversation"); }}
+                onArchive={() => archiveSession(currentProject.id, currentSession)} />
+              {!reviewOpen && <button className="header-button panel-toggle" title="打开工作面板" aria-label="打开工作面板" aria-expanded={false} onClick={() => setReviewOpen(true)}><Columns size={17} /></button>}
             </div>
           </header>
 
@@ -2016,15 +2195,17 @@ export function App() {
             {(runtimeError || (desktopMode && runtime.connected && !runtime.authenticated)) && (
               <div className={`runtime-banner ${runtimeError ? "is-error" : ""}`}>
                 <WarningCircle size={16} weight="fill" />
-                <span>{runtimeError || "Pi SDK 已连接，但尚未在 ~/.pi/agent/auth.json 配置模型凭据。工作区、会话和变更审查仍可使用。"}</span>
+                <span>{runtimeError || "Agentx 已连接，但尚未配置模型凭据。请在管理 → 模型与服务中设置；工作区、会话和变更审查仍可使用。"}</span>
               </div>
             )}
-            <div className="thread">
+            <div className="thread-viewport">
+            <div className="thread" ref={threadScroll.threadRef} onScroll={threadScroll.onScroll}>
+              <div className="thread-content" ref={threadScroll.contentRef}>
               {messages.length === 0 ? (
                 <div className="empty-thread">
                   <div className="empty-icon"><Cpu size={28} /></div>
                   <h2>开始一个任务</h2>
-                  <p>选择项目目录，然后告诉 Pi 你想完成什么。</p>
+                  <p>选择项目目录，然后告诉 Agentx 你想完成什么。</p>
                   <div className="suggestion-grid">
                     <button onClick={() => setInput("检查这个项目并说明它的结构")}>检查项目结构<CaretRight size={15} /></button>
                     <button onClick={() => setInput("运行测试并修复失败项")}>修复测试<CaretRight size={15} /></button>
@@ -2032,10 +2213,12 @@ export function App() {
                   </div>
                 </div>
               ) : messages.map((message) => (
-                <Message key={message.id} message={message} onReview={() => setReviewOpen(true)} />
+                <Message key={message.id} message={message} onReview={() => openPreview()} onOpenFile={openPreview} />
               ))}
-              {running && <div className="working-state"><CircleNotch size={15} className="spin" />Pi 正在工作</div>}
-              <div ref={threadEndRef} />
+              {running && <div className="working-state"><CircleNotch size={15} className="spin" />Agentx 正在工作</div>}
+              </div>
+            </div>
+            {threadScroll.awayFromBottom && <button className="thread-jump" type="button" onClick={threadScroll.jumpToBottom} title="回到最新消息" aria-label="回到最新消息"><ArrowDown size={16} />最新消息</button>}
             </div>
 
             <div className="composer-wrap">
@@ -2051,7 +2234,7 @@ export function App() {
                       submit();
                     }
                   }}
-                  placeholder={running ? "Pi 正在执行任务，你可以等待或停止" : "给 Pi 一个任务"}
+                  placeholder={running ? "Agentx 正在执行任务，你可以等待或停止" : "给 Agentx 一个任务"}
                   rows={2}
                   disabled={running}
                 />
@@ -2100,22 +2283,18 @@ export function App() {
                     </label>
                   </div>
                   {running ? (
-                    <button className="send-button stop-button" onClick={() => transportRef.current?.abort()} title="停止任务"><Stop size={16} weight="fill" /></button>
+                    <button className="send-button stop-button" onClick={() => transportRef.current?.abort(activeTaskId)} title="停止任务"><Stop size={16} weight="fill" /></button>
                   ) : (
                     <button className="send-button" onClick={submit} disabled={(!input.trim() && attachments.length === 0) || hasUnsupportedImage} title="发送"><ArrowUp size={17} weight="bold" /></button>
                   )}
                 </div>
               </div>
-              <div className="composer-meta">
-                <span><span className={`online-dot ${runtime.connected ? "" : "is-offline"}`} />{runtime.connected ? "Agent Host 已连接" : "请选择工作目录"}</span>
-                <span>Transport: {desktopMode ? `Electron IPC · Pi SDK${availableModels.length ? ` · ${availableModels.length} models` : ""}` : "浏览器 Mock"}</span>
-              </div>
             </div>
           </section>
 
-          {reviewOpen && <ReviewPanel onClose={() => setReviewOpen(false)} snapshot={changeSnapshot} onRefresh={refreshChanges} />}
           </div>
-        </>}
+          <WorkPanel key={activeTaskId} sessionId={activeTaskId} stateCache={panelStateCache.current} open={reviewOpen} visible={activeView === "conversation"} cwd={activeTask.cwd} changeCount={changeSnapshot?.files?.length ?? (desktopMode ? 0 : 6)} onClose={() => setReviewOpen(false)} request={previewRequest} MarkdownContent={MarkdownContent} renderDiff={(onOpenFile) => <ReviewPanel snapshot={changeSnapshot} onRefresh={refreshChanges} onOpenFile={onOpenFile} />} />
+        </div>
       </main>
 
       <ApprovalDialog approval={approval} onDecision={decideApproval} />
@@ -2151,7 +2330,7 @@ export function App() {
         onOpenSession={openSession}
         onNewSession={newSession}
         onRenameSession={renameSession}
-        onArchiveSession={archiveSession}
+        onArchiveSession={(projectId, session) => archiveSession(projectId, session).catch(() => {})}
         onRestoreSession={restoreSession}
         onDeleteDirectory={deleteProjectDirectory}
       />

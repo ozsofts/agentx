@@ -56,6 +56,7 @@ export function createMockTransport() {
   const listeners = new Set();
   const timers = new Set();
   let activeRun = null;
+  let mockPermission = "ask";
   let sequence = 0;
   let skills = [
     {
@@ -65,7 +66,7 @@ export function createMockTransport() {
       description: "快速梳理代码库结构、技术栈、关键入口与运行方式。",
       category: "项目理解",
       version: "1.0.0",
-      author: "Pi Desktop",
+      author: "Agentx",
       sourceType: "bundled",
       installed: true,
       managed: true,
@@ -82,7 +83,7 @@ export function createMockTransport() {
       description: "运行最相关的测试，定位失败原因并完成小范围修复。",
       category: "工程质量",
       version: "1.0.0",
-      author: "Pi Desktop",
+      author: "Agentx",
       sourceType: "bundled",
       installed: false,
       managed: false,
@@ -98,7 +99,7 @@ export function createMockTransport() {
       description: "审查当前改动中的缺陷、回归风险、安全问题和测试缺口。",
       category: "工程质量",
       version: "1.0.0",
-      author: "Pi Desktop",
+      author: "Agentx",
       sourceType: "bundled",
       installed: false,
       managed: false,
@@ -178,6 +179,10 @@ export function createMockTransport() {
 
     async projectCommand() {
       return null;
+    },
+
+    async sessionCommand() {
+      throw new Error("浏览器当前是演示模式，请在 Agentx 桌面版中管理本地会话");
     },
 
     async listSessions() {
@@ -291,6 +296,14 @@ export function createMockTransport() {
       return this.getModelSettings();
     },
 
+    async testModelSettings() {
+      return { ok: false, error: { message: "浏览器演示模式无法测试真实供应商，请在桌面应用中使用此功能。" } };
+    },
+
+    async fetchProviderModels() {
+      return { ok: false, error: { message: "浏览器演示模式无法读取供应商模型，请在桌面应用中使用此功能。" } };
+    },
+
     async clearProviderCredential() {
       return this.getModelSettings();
     },
@@ -329,6 +342,10 @@ export function createMockTransport() {
         () => {
           if (!activeRun) return;
           activeRun.waiting = true;
+          if (mockPermission !== "ask") {
+            this.respondToApproval({ approved: mockPermission === "full" });
+            return;
+          }
           emit({
             type: "approval.requested",
             sessionId,
@@ -449,7 +466,7 @@ export function createMockTransport() {
       emit({ type: "run.settled", sessionId, runId, status: "aborted" });
     },
 
-    async setPermissionMode() {},
+    async setPermissionMode(mode) { mockPermission = mode; },
 
     async getChanges() {
       return null;
@@ -513,6 +530,10 @@ function createElectronTransport(bridge) {
       return bridge.projectCommand(command);
     },
 
+    sessionCommand(command) {
+      return bridge.sessionCommand(command);
+    },
+
     listSessions({ cwd, projectId } = {}) {
       return bridge.command({ type: "listSessions", cwd, projectId });
     },
@@ -565,6 +586,14 @@ function createElectronTransport(bridge) {
       return bridge.command({ type: "saveModelSettings", ...settings });
     },
 
+    testModelSettings(settings) {
+      return bridge.command({ ...settings, type: "testModelSettings" });
+    },
+
+    fetchProviderModels(settings) {
+      return bridge.command({ ...settings, type: "fetchProviderModels" });
+    },
+
     clearProviderCredential(providerId) {
       return bridge.command({ type: "clearProviderCredential", providerId });
     },
@@ -573,24 +602,24 @@ function createElectronTransport(bridge) {
       return bridge.command({ type: "setModel", providerId, modelId });
     },
 
-    prompt({ text, attachments }) {
-      return bridge.command({ type: "prompt", text, attachments });
+    prompt({ sessionId, text, attachments }) {
+      return bridge.command({ type: "prompt", sessionId, text, attachments });
     },
 
-    respondToApproval({ requestId, approved, remember }) {
-      return bridge.command({ type: "approvalResponse", requestId, approved, remember });
+    respondToApproval({ requestId, sessionId, approved, remember }) {
+      return bridge.command({ type: "approvalResponse", requestId, sessionId, approved, remember });
     },
 
-    abort() {
-      return bridge.command({ type: "abort" });
+    abort(sessionId) {
+      return bridge.command({ type: "abort", sessionId });
     },
 
-    setPermissionMode(mode) {
-      return bridge.command({ type: "setPermissionMode", mode });
+    setPermissionMode(mode, sessionId) {
+      return bridge.command({ type: "setPermissionMode", mode, sessionId });
     },
 
-    getChanges() {
-      return bridge.command({ type: "getChanges" });
+    getChanges(sessionId) {
+      return bridge.command({ type: "getChanges", sessionId });
     },
 
     dispose() {

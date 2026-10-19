@@ -27,7 +27,7 @@ const bundledCatalog = [
     description: "快速梳理代码库结构、技术栈、关键入口与运行方式。",
     category: "项目理解",
     version: "1.0.0",
-    author: "Pi Desktop",
+    author: "Agentx",
     sourceType: "bundled",
   },
   {
@@ -37,7 +37,7 @@ const bundledCatalog = [
     description: "运行最相关的测试，定位失败原因并完成小范围修复。",
     category: "工程质量",
     version: "1.0.0",
-    author: "Pi Desktop",
+    author: "Agentx",
     sourceType: "bundled",
   },
   {
@@ -47,7 +47,7 @@ const bundledCatalog = [
     description: "审查当前改动中的缺陷、回归风险、安全问题和测试缺口。",
     category: "工程质量",
     version: "1.0.0",
-    author: "Pi Desktop",
+    author: "Agentx",
     sourceType: "bundled",
   },
 ];
@@ -295,7 +295,7 @@ export class SkillsService {
       try {
         await this.reload?.();
       } catch (error) {
-        reloadWarning = `Skill 已安装，但 Pi 重载失败：${error.message}`;
+        reloadWarning = `Skill 已安装，但 Agentx 重载失败：${error.message}`;
       }
     }
     return { ...await this.list(), reloadWarning };
@@ -304,7 +304,7 @@ export class SkillsService {
   async remove(name, options = {}) {
     assertSkillName(name);
     const state = await readInstallState(this.cwd);
-    if (!state.skills[name]) throw new Error("只能卸载由 Pi Desktop 安装的 Skill");
+    if (!state.skills[name]) throw new Error("只能卸载由 Agentx 安装的 Skill");
     const skillsRoot = path.join(this.cwd, ".pi", "skills");
     const targetPath = path.join(skillsRoot, name);
     if (!isWithin(skillsRoot, targetPath)) throw new Error("卸载路径超出工作区 Skills 目录");
@@ -330,7 +330,7 @@ export class SkillsService {
       try {
         await this.reload?.();
       } catch (error) {
-        reloadWarning = `Skill 已卸载，但 Pi 重载失败：${error.message}`;
+        reloadWarning = `Skill 已卸载，但 Agentx 重载失败：${error.message}`;
       }
     }
     return { ...await this.list(), reloadWarning };
