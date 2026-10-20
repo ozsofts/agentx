@@ -185,7 +185,7 @@ button { color: inherit; }
 .project-nav-group { margin-bottom: 3px; }
 .project-nav-group.is-archived { opacity: .62; }
 .project-nav-item-wrap { position: relative; display: flex; align-items: stretch; }
-.project-nav-item { width: 100%; min-height: 49px; display: flex; align-items: center; gap: 9px; padding: 7px 9px; border: 0; border-radius: 7px; background: transparent; text-align: left; cursor: pointer; }
+.project-nav-item { width: 100%; min-height: 39px; display: flex; align-items: center; gap: 9px; padding: 7px 9px; border: 0; border-radius: 7px; background: transparent; text-align: left; cursor: pointer; }
 .project-nav-item:hover, .project-nav-item.is-active { background: #e5e5e0; }
 .project-nav-item-wrap .project-nav-item { padding-right: 60px; }
 .project-nav-actions { position: absolute; top: 50%; right: 7px; display: flex; gap: 2px; transform: translateY(-50%); opacity: 0; transition: opacity 120ms ease; }
@@ -218,6 +218,16 @@ button { color: inherit; }
 .project-session-popover .project-session-item:focus-visible { outline: 2px solid #34845c; outline-offset: -2px; }
 .project-session-current { margin-left: auto; color: #34845c; }
 .project-session-popover-empty { margin: 0; padding: 16px 8px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.project-info-popover { position: fixed; z-index: 45; max-height: calc(100dvh - 24px); overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: #fff; color: var(--text); box-shadow: 0 8px 28px #0002; font-size: 12px; }
+.project-info-popover header { display: flex; align-items: center; gap: 9px; }
+.project-info-popover header strong { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 550; }
+.project-info-popover svg { flex-shrink: 0; color: var(--muted); }
+.project-info-count { display: flex; align-items: center; gap: 9px; padding: 9px 0 12px; color: var(--muted); }
+.project-info-path { display: flex; align-items: center; gap: 9px; padding: 13px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.project-info-path span { min-width: 0; }
+.project-info-path small { display: block; margin-top: 5px; color: var(--red); }
+.project-info-edit { display: flex; align-items: center; gap: 9px; width: 100%; padding: 12px 0 0; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--muted); text-align: left; font: inherit; cursor: pointer; }
+.project-info-edit:hover { color: var(--text); }
 .is-collapsed .project-nav-item { width: 42px; min-height: 42px; justify-content: center; padding: 0; }
 .is-collapsed .project-nav-item-wrap .project-nav-item { padding-right: 0; }
 .is-collapsed .section-label-row { display: none; }
@@ -293,11 +303,21 @@ button { color: inherit; }
 .thread-jump { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 5px; padding: 7px 11px; border: 1px solid var(--line-strong); border-radius: 18px; background: #fff; color: var(--muted); box-shadow: 0 2px 10px rgba(0,0,0,.08); font-size: 11px; cursor: pointer; }
 .thread-jump:hover { color: var(--text); background: var(--surface-muted); }
 
-.user-message { width: fit-content; max-width: min(82%, 610px); margin: 0 0 34px auto; padding: 11px 15px; border-radius: 16px 16px 4px 16px; background: #f0f0ed; font-size: 14px; line-height: 1.55; }
+.user-message { width: fit-content; max-width: min(82%, 610px); margin: 0 0 34px auto; font-size: 14px; line-height: 1.55; }
+.user-message-bubble { padding: 11px 15px; border-radius: 16px 16px 4px 16px; background: #f0f0ed; }
 .user-message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .user-message .attachment-list { margin: 0 0 8px; }
 .user-message .attachment-list:last-child { margin-bottom: 0; }
 .assistant-message { max-width: 720px; margin: 0 0 34px; color: #242527; font-size: 14px; line-height: 1.72; }
+.message-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 8px; min-height: 24px; color: var(--muted); font-size: 11px; line-height: 1.4; opacity: 0; pointer-events: none; }
+.user-message:hover .message-meta, .assistant-message:hover .message-meta, .user-message:focus-within .message-meta, .assistant-message:focus-within .message-meta { opacity: 1; pointer-events: auto; }
+.user-message .message-meta { justify-content: flex-end; }
+.message-meta time { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.message-copy { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; flex-shrink: 0; border: 0; border-radius: 5px; color: var(--muted); background: transparent; cursor: pointer; }
+.message-copy:hover, .message-copy:focus-visible { color: var(--text); background: #00000008; }
+.message-copy:disabled { opacity: .35; cursor: default; }
+.message-copy-status:empty { display: none; }
+@media (hover: none) { .message-meta { opacity: 1; pointer-events: auto; } }
 .message-error { margin-top: 12px; padding: 12px 14px; border: 1px solid #efc7ca; border-radius: 10px; background: #fff1f2; color: #973942; font-size: 13px; }
 .message-error-title { display: flex; align-items: center; gap: 7px; }
 .message-error p { margin: 6px 0; }
@@ -437,7 +457,7 @@ button { color: inherit; }
 .input-queue-actions .queue-primary-action { display: flex; width: auto; gap: 5px; padding: 0 5px; font: inherit; font-size: 11px; }
 .input-queue-actions button:hover { background: #eeeee9; }
 .input-queue-actions button:disabled { opacity: .4; cursor: default; }
-.input-queue-menu { position: fixed; z-index: 90; min-width: 190px; padding: 5px; border: 1px solid var(--line); border-radius: 9px; background: #fff; box-shadow: 0 6px 22px #0002; }
+.input-queue-menu { position: fixed; z-index: 90; min-width: min(190px, calc(100vw - 16px)); max-width: calc(100vw - 16px); max-height: calc(100dvh - 16px); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 9px; background: #fff; box-shadow: 0 6px 22px #0002; }
 .input-queue-menu button { width: 100%; min-height: 34px; display: flex; align-items: center; gap: 8px; padding: 7px 9px; border: 0; border-radius: 5px; background: transparent; color: var(--text); text-align: left; font-size: 12px; cursor: pointer; }
 .input-queue-menu button:hover, .input-queue-menu button:focus-visible { background: var(--surface-muted); }
 .input-queue-menu button:disabled { color: var(--faint); cursor: default; }

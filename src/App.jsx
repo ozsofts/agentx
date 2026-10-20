@@ -48,6 +48,9 @@ import useThreadScroll from "./useThreadScroll.js";
 import Modal from "./Modal.jsx";
 import CollapsedProjectSessions from "./CollapsedProjectSessions.jsx";
 import QueuedInputs from "./QueuedInputs.jsx";
+import { formatMessageTime } from "./message-time.js";
+import ProjectInfo from "./ProjectInfo.jsx";
+import { readAttachmentFiles } from "./attachment-files.js";
 
 const desktopMode = Boolean(window.piDesktop);
 
@@ -311,9 +314,36 @@ const MarkdownContent = memo(function MarkdownContent({ children, resourceUrl, o
   );
 });
 
-function Message({ message, onReview, onOpenFile }) {
+function MessageMeta({ message, now }) {
+  const [copyStatus, setCopyStatus] = useState("");
+  const resetTimer = useRef();
+  useEffect(() => () => window.clearTimeout(resetTimer.current), []);
+  const timestamp = Number.isFinite(message.timestamp) ? new Date(message.timestamp) : null;
+  const date = timestamp && Number.isFinite(timestamp.getTime()) ? timestamp : null;
+  const text = message.text || message.error?.message || (message.attachments || []).map((item) => item.name).join("\n");
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      setCopyStatus("copied");
+    } catch { setCopyStatus("error"); }
+    window.clearTimeout(resetTimer.current);
+    resetTimer.current = window.setTimeout(() => setCopyStatus(""), 1800);
+  };
+  const time = date ? <time dateTime={date.toISOString()} title={date.toLocaleString("zh-CN", { hourCycle: "h23", timeZoneName: "short" })}>{formatMessageTime(message.timestamp, now)}</time> : <span className="message-time-unknown">时间未知</span>;
+  return <div className="message-meta">
+    {message.role === "user" && time}
+    <button type="button" className="message-copy" disabled={!text} onClick={copy} title={copyStatus === "copied" ? "已复制" : "复制消息正文"} aria-label={message.role === "user" ? "复制用户消息" : "复制模型回复"}>
+      {copyStatus === "copied" ? <Check size={14} /> : <Copy size={14} />}
+    </button>
+    {message.role !== "user" && time}
+    <span className="message-copy-status" role="status">{copyStatus === "copied" ? "已复制" : copyStatus === "error" ? "复制失败，请重试" : ""}</span>
+  </div>;
+}
+
+function Message({ message, now, onReview, onOpenFile }) {
   if (message.role === "user") {
-    return <div className="user-message"><AttachmentList attachments={message.attachments} />{message.text && <div className="user-message-text">{message.text}</div>}</div>;
+    return <div className="user-message"><div className="user-message-bubble"><AttachmentList attachments={message.attachments} />{message.text && <div className="user-message-text">{message.text}</div>}</div><MessageMeta message={message} now={now} /></div>;
   }
   return (
     <article className="assistant-message">
@@ -337,11 +367,12 @@ function Message({ message, onReview, onOpenFile }) {
           <CaretRight size={15} />
         </button>
       )}
+      <MessageMeta message={message} now={now} />
     </article>
   );
 }
 
-function Sidebar({ tasks, projects, runningSessions, activeProjectId, activeTaskId, onSelect, onProjectSelect, onSessionSelect, onRenameSession, onCreateProject, onCreateSession, onManageProject, onNew, collapsed, onCollapse, runtime, activeView, onManagement }) {
+function Sidebar({ tasks, projects, runningSessions, activeProjectId, activeTaskId, onSelect, onProjectSelect, onSessionSelect, onRenameSession, onCreateProject, onCreateSession, onManageProject, onUpdateProject, onNew, collapsed, onCollapse, runtime, activeView, onManagement }) {
   const [query, setQuery] = useState("");
   const [flyoutProjectId, setFlyoutProjectId] = useState(null);
   const closeFlyout = useCallback((id) => setFlyoutProjectId((current) => current === id ? null : current), []);
@@ -401,8 +432,7 @@ function Sidebar({ tasks, projects, runningSessions, activeProjectId, activeTask
         )}
         {visibleProjects.map((project) => (
           <div className={`project-nav-group ${project.archived ? "is-archived" : ""}`} key={project.id}>
-            <div className="project-nav-item-wrap">
-              {collapsed ? <CollapsedProjectSessions
+              {collapsed ? <div className="project-nav-item-wrap"><CollapsedProjectSessions
                 project={project}
                 active={activeProjectId === project.id}
                 activeTaskId={activeTaskId}
@@ -412,24 +442,8 @@ function Sidebar({ tasks, projects, runningSessions, activeProjectId, activeTask
                 onClose={closeFlyout}
                 onSessionSelect={onSessionSelect}
                 onCreateSession={onCreateSession}
-              /> : <button
-                className={`project-nav-item ${activeProjectId === project.id ? "is-active" : ""}`}
-                onClick={() => onProjectSelect(project.id)}
-                title={project.rootPath}
-              >
-                <span className={`project-nav-icon ${project.pathExists === false ? "is-missing" : ""}`}><FolderOpen size={16} /></span>
-                {!collapsed && (
-                  <span className="task-copy">
-                    <span className="task-title">{project.name}</span>
-                    <span className="task-meta">{project.archived ? "已归档 · " : ""}{project.sessions?.filter((session) => !session.archived).length || 0} 个 Session</span>
-                  </span>
-                )}
-              </button>}
-              {!collapsed && <div className="project-nav-actions">
-                <button className="project-nav-action" onClick={() => onCreateSession(project)} title="新建 Session" aria-label="新建 Session"><Plus size={14} weight="bold" /></button>
-                <button className="project-nav-action" onClick={() => onManageProject(project.id)} title="编辑当前项目" aria-label="编辑当前项目"><PencilSimple size={14} /></button>
-              </div>}
-            </div>
+              /></div> : <ProjectInfo project={project} active={activeProjectId === project.id} open={flyoutProjectId === project.id}
+                onOpen={setFlyoutProjectId} onClose={closeFlyout} onSelect={onProjectSelect} onCreateSession={onCreateSession} onManage={onManageProject} onPin={onUpdateProject} />}
             {!collapsed && activeProjectId === project.id && (
               <div className="project-session-list">
                 {(project.sessions || []).filter((session) => !session.archived).map((session) => (
@@ -1468,6 +1482,27 @@ function modelValue(model) {
 
 export function App() {
   const transportRef = useRef(null);
+  const [messageDate, setMessageDate] = useState(() => Date.now());
+  useEffect(() => {
+    let timer;
+    const refresh = () => {
+      window.clearTimeout(timer);
+      const now = Date.now();
+      setMessageDate(now);
+      const midnight = new Date(now);
+      midnight.setHours(24, 0, 0, 0);
+      timer = window.setTimeout(refresh, midnight.getTime() - now + 100);
+    };
+    const onVisible = () => { if (!document.hidden) refresh(); };
+    refresh();
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
   const [tasks, setTasks] = useState(() => desktopMode
     ? [{ id: "workspace", title: "选择工作目录", repo: "未连接", branch: "-", time: "现在", status: "idle" }]
     : initialTasks);
@@ -1583,11 +1618,25 @@ export function App() {
         transport.listProjects?.().then((items) => setProjects(items || [])).catch(() => {});
       }
       if (event.type === "projects.updated") setProjects(event.projects || []);
+      if (event.type === "session.updated") {
+        // Replace optimistic send times with Pi's persisted timestamps without
+        // replacing live assistant output or its expanded process state.
+        const users = (event.messages || []).filter((message) => message.role === "user");
+        setSessions((current) => {
+          let index = 0;
+          const list = (current[event.sessionId] || []).map((message) => {
+            if (message.role !== "user") return message;
+            const saved = users[index++];
+            return Number.isFinite(saved?.timestamp) ? { ...message, timestamp: saved.timestamp } : message;
+          });
+          return { ...current, [event.sessionId]: list };
+        });
+      }
       if (event.type === "queue.updated") setInputQueues((current) => ({ ...current, [event.sessionId]: event.entries || [] }));
       if (event.type === "input.consumed") {
         setSessions((current) => ({ ...current, [event.sessionId]: [
           ...(current[event.sessionId] || []).filter((message) => message.id !== `user-${event.input.id}`),
-          { id: `user-${event.input.id}`, role: "user", text: event.input.text, attachments: event.input.attachments },
+          { id: `user-${event.input.id}`, role: "user", text: event.input.text, attachments: event.input.attachments, timestamp: event.input.timestamp ?? event.timestamp },
         ] }));
       }
       const isCurrent = !event.sessionId || event.sessionId === activeSessionRef.current;
@@ -1613,7 +1662,7 @@ export function App() {
           const list = [...(current[event.sessionId] || [])];
           const existing = list.findIndex((message) => message.role === "assistant" && message.runId === event.runId);
           if (existing >= 0) return current;
-          list.push({ id: `assistant-${event.runId || event.messageId}`, runId: event.runId, role: "assistant", text: "", activities: [], status: "running", startedAt: event.startedAt || Date.now() });
+          list.push({ id: `assistant-${event.runId || event.messageId}`, runId: event.runId, role: "assistant", text: "", activities: [], status: "running", startedAt: event.startedAt || Date.now(), timestamp: event.timestamp });
           return { ...current, [event.sessionId]: list };
         });
       }
@@ -1628,7 +1677,7 @@ export function App() {
           const list = [...(current[event.sessionId] || [])];
           const index = list.findIndex((message) => message.role === "assistant" && message.runId === event.runId);
           if (index >= 0) list[index] = { ...list[index], error: event.error, status: "error" };
-          else list.push({ id: `assistant-${event.runId}`, runId: event.runId, role: "assistant", text: "", activities: [], error: event.error, status: "error" });
+          else list.push({ id: `assistant-${event.runId}`, runId: event.runId, role: "assistant", text: "", activities: [], error: event.error, status: "error", timestamp: event.timestamp });
           return { ...current, [event.sessionId]: list };
         });
       }
@@ -1953,16 +2002,25 @@ export function App() {
     setReviewOpen(false);
   };
 
-  const chooseAttachments = async () => {
-    if (attachmentPickerBusy || attachments.length >= 8) return;
+  const attachmentImportBusy = useRef(false);
+  const importAttachments = async (read) => {
+    if (attachmentImportBusy.current) { setAttachmentError("正在读取附件，请稍后再试"); return; }
+    if (attachments.length >= 8) { setAttachmentError("每条消息最多添加 8 个附件"); return; }
+    const sessionId = activeTaskId;
+    attachmentImportBusy.current = true;
     setAttachmentPickerBusy(true);
     setAttachmentError("");
     try {
-      const result = await transportRef.current?.chooseAttachments?.({ maxFiles: 8 - attachments.length });
+      const result = await read({ maxFiles: 8 - attachments.length });
+      // A file read can finish after a Session switch; retain its attachments
+      // with the draft that initiated the import, never the newly selected chat.
+      const draft = draftCache.current.get(sessionId) || { text: "", attachments: [] };
+      const existing = draft.attachments || [];
       const rejected = [...(result?.rejected || [])];
       const accepted = [];
-      let totalBytes = attachments.reduce((sum, item) => sum + (item.size || 0), 0);
+      let totalBytes = existing.reduce((sum, item) => sum + (item.size || 0), 0);
       for (const attachment of (result?.attachments || [])) {
+        if (existing.length + accepted.length >= 8) { rejected.push({ name: attachment.name, message: "每条消息最多添加 8 个附件" }); continue; }
         if (attachment.kind === "image" && !supportsImages) {
           rejected.push({ name: attachment.name, message: "当前模型不支持图片输入" });
           continue;
@@ -1974,13 +2032,31 @@ export function App() {
         totalBytes += attachment.size || 0;
         accepted.push(attachment);
       }
-      if (accepted.length) setAttachments((current) => [...current, ...accepted].slice(0, 8));
-      if (rejected.length) setAttachmentError(rejected.map((item) => `${item.name}：${item.message}`).join("；"));
+      if (accepted.length) {
+        const next = [...existing, ...accepted];
+        draftCache.current.set(sessionId, { ...draft, attachments: next });
+        if (activeSessionRef.current === sessionId) setAttachments(next);
+      }
+      if (rejected.length && activeSessionRef.current === sessionId) setAttachmentError(rejected.map((item) => `${item.name}：${item.message}`).join("；"));
     } catch (error) {
-      setAttachmentError(error.message || "无法添加附件");
+      if (activeSessionRef.current === sessionId) setAttachmentError(error.message || "无法添加附件");
     } finally {
+      attachmentImportBusy.current = false;
       setAttachmentPickerBusy(false);
     }
+  };
+
+  const chooseAttachments = () => importAttachments((options) => transportRef.current?.chooseAttachments?.(options));
+  const pasteAttachments = (event) => {
+    const files = [...(event.clipboardData?.files || [])];
+    if (!files.length) {
+      for (const item of event.clipboardData?.items || []) {
+        if (item.kind === "file") { const file = item.getAsFile(); if (file) files.push(file); }
+      }
+    }
+    if (!files.length) return;
+    event.preventDefault();
+    importAttachments((options) => readAttachmentFiles(files, options));
   };
 
   const removeAttachment = (id) => {
@@ -1990,7 +2066,7 @@ export function App() {
 
   const submit = async () => {
     const text = input.trim();
-    if ((!text && attachments.length === 0) || submittingInput.current) return;
+    if ((!text && attachments.length === 0) || submittingInput.current || attachmentImportBusy.current) return;
     if (hasUnsupportedImage) {
       setAttachmentError("当前模型不支持图片输入，请移除图片或切换模型。");
       return;
@@ -2029,7 +2105,7 @@ export function App() {
     setRuntimeError("");
     setSessions((current) => ({
       ...current,
-      [activeTaskId]: [...(current[activeTaskId] || []), { id: `user-${Date.now()}`, role: "user", text: displayText, attachments: submittedAttachments }],
+      [activeTaskId]: [...(current[activeTaskId] || []), { id: `user-${Date.now()}`, role: "user", text: displayText, attachments: submittedAttachments, timestamp: Date.now() }],
     }));
     if (activeTask.title === "未命名会话") {
       setTasks((current) => current.map((task) => task.id === activeTaskId ? { ...task, title: displayText.slice(0, 24), repo: "pi-desktop" } : task));
@@ -2212,6 +2288,7 @@ export function App() {
         onCreateProject={openCreateProject}
         onCreateSession={(project) => { setActiveProjectId(project.id); newSession(project.id); setApproval(null); }}
         onManageProject={(projectId) => { setActiveProjectId(projectId); openProjectManager(projectId); }}
+        onUpdateProject={updateProject}
         onNew={createTask}
         collapsed={sidebarCollapsed}
         onCollapse={() => setSidebarCollapsed((value) => !value)}
@@ -2288,7 +2365,7 @@ export function App() {
                   </div>
                 </div>
               ) : messages.map((message) => (
-                <Message key={message.id} message={message} onReview={() => openPreview()} onOpenFile={openPreview} />
+                <Message key={message.id} message={message} now={messageDate} onReview={() => openPreview()} onOpenFile={openPreview} />
               ))}
               {running && <div className="working-state"><CircleNotch size={15} className="spin" />Agentx 正在工作</div>}
               </div>
@@ -2304,6 +2381,7 @@ export function App() {
                 <textarea
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
+                  onPaste={pasteAttachments}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
                       event.preventDefault();
@@ -2325,7 +2403,6 @@ export function App() {
                     >
                       {attachmentPickerBusy ? <CircleNotch size={17} className="spin" /> : <Paperclip size={17} />}
                     </button>
-                    <button className="tool-button" title="选择工作目录" onClick={openWorkspace}><FolderOpen size={17} /></button>
                     <label className="select-control">
                       <Cpu size={15} />
                       <select
@@ -2359,7 +2436,7 @@ export function App() {
                   </div>
                   <div className="composer-send-actions">
                     {running && <button className="send-button stop-button" onClick={() => transportRef.current?.abort(activeTaskId).catch((error) => setRuntimeError(error.message))} title="停止任务" aria-label="停止任务"><Stop size={16} weight="fill" /></button>}
-                    <button className="send-button" onClick={submit} disabled={sendingInput || (!input.trim() && attachments.length === 0) || hasUnsupportedImage} title={running ? "排队发送" : "发送"} aria-label={running ? "排队发送" : "发送"}>{sendingInput ? <CircleNotch size={17} className="spin" /> : <ArrowUp size={17} weight="bold" />}</button>
+                    <button className="send-button" onClick={submit} disabled={sendingInput || attachmentPickerBusy || (!input.trim() && attachments.length === 0) || hasUnsupportedImage} title={running ? "排队发送" : "发送"} aria-label={running ? "排队发送" : "发送"}>{sendingInput ? <CircleNotch size={17} className="spin" /> : <ArrowUp size={17} weight="bold" />}</button>
                   </div>
                 </div>
               </div>

@@ -5,8 +5,9 @@ import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { app, dialog, Menu, webContents } from "electron";
+import { app, clipboard, dialog, Menu, nativeImage, webContents } from "electron";
 
 // Exercise the production renderer, preload, main IPC and real utility process.
 // All Desktop and Pi state is isolated from the user's settings and sessions.
@@ -51,7 +52,7 @@ const modelServer = createServer(async (request, response) => {
     chunk({ role: "assistant" });
     if (next.hold) {
       chunk({ content: next.text });
-      heldResponses.push(() => { chunk({ content: " Finished." }, "stop"); response.end("data: [DONE]\n\n"); });
+      heldResponses.push(Object.assign(() => { chunk({ content: " Finished." }, "stop"); response.end("data: [DONE]\n\n"); }, { stream: (text) => chunk({ content: text }) }));
       return;
     }
     if (next.text) {
@@ -71,7 +72,9 @@ await once(modelServer, "listening");
 const baseUrl = `http://127.0.0.1:${modelServer.address().port}/v1`;
 await writeFile(path.join(agentDir, "models.json"), JSON.stringify({ providers: { openai: {
   baseUrl, api: "openai-completions", models: [{ id: "error-smoke", name: "Error Smoke", input: ["text"],
-    contextWindow: 128000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+    contextWindow: 128000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    { id: "vision-smoke", name: "Vision Smoke", input: ["text", "image"], contextWindow: 128000, maxTokens: 4096,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
 } } }));
 app.setPath("userData", userData);
 process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -92,6 +95,9 @@ app.once("will-quit", async (event) => {
   }
 });
 app.once("browser-window-created", (_event, window) => {
+  // Native guest views can take focus during smoke tests; keep renderer frame
+  // callbacks running so bounds/visibility checks do not depend on OS focus.
+  window.webContents.setBackgroundThrottling(false);
   window.webContents.once("did-finish-load", async () => {
     try {
       let mounted = false;
@@ -133,8 +139,8 @@ app.once("browser-window-created", (_event, window) => {
       assert.ok(Array.isArray(changes.files));
       const restored = await invoke("restoreWorkspace");
       assert.equal(restored.cwd, workspace);
-      const evaluate = async (code) => {
-        try { return await window.webContents.executeJavaScript(code); }
+      const evaluate = async (code, userGesture = false) => {
+        try { return await window.webContents.executeJavaScript(code, userGesture); }
         catch (error) { throw new Error(`${error.message}\nRenderer command: ${code}`); }
       };
       const waitFor = async (code, label) => {
@@ -142,8 +148,39 @@ app.once("browser-window-created", (_event, window) => {
           if (await evaluate(code)) return;
           await delay(100);
         }
-        assert.fail(label);
+        assert.fail(`${label}; native views: ${JSON.stringify(window.contentView.children.map(view => ({ visible: view.getVisible(), bounds: view.getBounds() })))}`);
       };
+      assert.equal(await evaluate("document.querySelector('.composer [title=\"选择工作目录\"]')"), null, "Project picker remained in the composer");
+      assert.equal(await evaluate("document.querySelectorAll('.sidebar .project-nav-item .task-meta').length"), 0, "Project rows still show Session counts");
+      const originalDraft = await evaluate("document.querySelector('.composer textarea').value");
+      app.focus({ steal: true }); window.focus(); window.webContents.focus();
+      await evaluate("document.querySelector('.composer textarea').focus()");
+      clipboard.writeText("普通粘贴文字");
+      window.webContents.paste();
+      await waitFor("document.querySelector('.composer textarea').value.includes('普通粘贴文字')", "Plain text paste did not enter the draft");
+      clipboard.writeImage(nativeImage.createFromBitmap(Buffer.alloc(16, 255), { width: 2, height: 2 }));
+      window.webContents.paste();
+      await waitFor("document.querySelector('.attachment-error')?.textContent.includes('不支持图片')", "Pasted screenshot ignored the model capability check");
+      assert.equal(await evaluate("document.querySelectorAll('.composer .attachment-item').length"), 0);
+      await invoke("command", { type: "setModel", providerId: "openai", modelId: "vision-smoke" });
+      await waitFor("document.querySelector('.composer .select-control select').value.includes('vision-smoke')", "Vision fixture did not reach the composer");
+      await evaluate("document.querySelector('.composer textarea').focus()");
+      window.webContents.paste();
+      await waitFor("Boolean(document.querySelector('.composer .attachment-item.is-image img'))", "Native screenshot paste did not create an attachment");
+      const pasteFiles = (files) => evaluate(`(() => { const data = new DataTransfer(); for (const file of ${JSON.stringify(files)}) data.items.add(new File([file.text], file.name, { type: file.type || 'text/plain' })); const event = new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }); document.querySelector('.composer textarea').dispatchEvent(event); return event.defaultPrevented; })()`);
+      assert.equal(await pasteFiles([{ name: "clipboard.md", text: "# 粘贴的文本文件" }, { name: "unsupported.pdf", text: "%PDF-1.7" }]), true);
+      await waitFor("document.querySelector('.composer .attachment-list')?.textContent.includes('clipboard.md') && document.querySelector('.attachment-error')?.textContent.includes('unsupported.pdf')", "Pasted files were not accepted/rejected separately");
+      if (process.platform === "darwin") {
+        clipboard.writeBuffer("public.file-url", Buffer.from(pathToFileURL(path.join(workspace, "README.md")).href));
+        await evaluate("document.querySelector('.composer textarea').focus()");
+        window.webContents.paste();
+        await waitFor("document.querySelector('.composer .attachment-list')?.textContent.includes('README.md')", "Native copied text file did not paste as an attachment");
+      }
+      assert.equal(await evaluate("document.querySelector('.composer textarea').value"), `${originalDraft}普通粘贴文字`, "File paste altered the text draft");
+      await evaluate(`(() => { document.querySelectorAll('.composer .attachment-remove').forEach(button => button.click()); const input = document.querySelector('.composer textarea'); Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, ${JSON.stringify(originalDraft)}); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+      await invoke("command", { type: "setModel", providerId: "openai", modelId: "error-smoke" });
+      await waitFor("document.querySelectorAll('.composer .attachment-item').length === 0", "Pasted test attachments did not clear");
+      console.log("[desktop-smoke] PASS: native screenshot/file paste, ordinary text, mixed unsupported files, model capability validation and unchanged drafts");
       // A long approval in a short window must survive wheel input, keep
       // decisions reachable, and release background interaction on dismissal.
       const modalSize = window.getContentSize();
@@ -179,12 +216,12 @@ app.once("browser-window-created", (_event, window) => {
       await waitFor("!document.querySelector('.modal-backdrop') && !document.querySelector('#root').inert && !document.documentElement.style.overflow", "Closing dialogs left a backdrop or scroll lock behind");
       window.setContentSize(...modalSize);
       window.setMinimumSize(...modalMinimum);
-      await waitFor(`innerHeight === ${modalSize[1]}`, "Original window size was not restored");
+      await waitFor(`innerHeight === ${modalSize[1]} && innerWidth === ${modalSize[0]}`, "Original window size was not restored");
       console.log("[desktop-smoke] PASS: short-window long approval, wheel isolation, internal scrolling, focus trap, Escape cancellation and nested modal cleanup");
       await evaluate("if (document.querySelector('.work-panel').hidden) document.querySelector('.header-actions .header-button').click()");
       assert.equal(await evaluate("document.querySelectorAll('.work-tab').length"), 0, "An empty panel should not default to Diff");
       assert.ok(await evaluate("Boolean(document.querySelector('.work-empty-actions'))"));
-      assert.ok(await evaluate("Math.abs(document.querySelector('.work-panel-tabbar').getBoundingClientRect().top - document.querySelector('.workspace-header').getBoundingClientRect().top) < 1"), "Panel tabs were not moved to the top header");
+      await waitFor("Math.abs(document.querySelector('.work-panel-tabbar').getBoundingClientRect().top - document.querySelector('.workspace-header').getBoundingClientRect().top) < 1", "Panel tabs were not moved to the top header");
       await writeFile(path.join(os.tmpdir(), "agentx-panel-empty.png"), (await window.webContents.capturePage()).toPNG());
       const browserUrl = `http://127.0.0.1:${modelServer.address().port}/browser/first`;
       await evaluate("[...document.querySelectorAll('.work-empty-actions button')].find(button => button.textContent.includes('打开网页')).click()");
@@ -202,6 +239,33 @@ app.once("browser-window-created", (_event, window) => {
         assert.fail(label);
       };
       await waitForNative(() => browserView()?.getVisible(), "Browser view was not shown inside the panel");
+      const projectPoint = await evaluate("(() => { const r = document.querySelector('.sidebar .project-nav-item').getBoundingClientRect(); return { x: Math.round(r.left + 60), y: Math.round(r.top + r.height / 2) }; })()");
+      window.webContents.sendInputEvent({ type: "mouseMove", ...projectPoint });
+      await waitFor("Boolean(document.querySelector('.project-info-popover'))", "Project hover did not show its info card");
+      assert.ok(await evaluate(`(() => { const card = document.querySelector('.project-info-popover'); const r = card.getBoundingClientRect(); return card.textContent.includes('Upgrade smoke') && card.textContent.includes('0 个会话') && card.textContent.includes(${JSON.stringify(workspace)}) && r.left >= 0 && r.right <= innerWidth && r.bottom <= innerHeight; })()`));
+      await waitForNative(() => !browserView().getVisible(), "Native webpage covered project information");
+      const cardPoint = await evaluate("(() => { const r = document.querySelector('.project-info-popover').getBoundingClientRect(); return { x: Math.round(r.left + 40), y: Math.round(r.top + 30) }; })()");
+      window.webContents.sendInputEvent({ type: "mouseMove", ...cardPoint });
+      await delay(300);
+      assert.ok(await evaluate("Boolean(document.querySelector('.project-info-popover'))"), "Crossing into the project card closed it");
+      await evaluate("document.querySelector('.project-info-popover [aria-label=\"固定项目\"]').click()");
+      await waitFor("document.querySelector('.project-info-popover [aria-pressed=true]')", "Project pin was not saved");
+      await writeFile(path.join(os.tmpdir(), "agentx-project-info.png"), (await window.webContents.capturePage()).toPNG());
+      escapeModal();
+      await waitFor("!document.querySelector('.project-info-popover') && document.activeElement.matches('.project-nav-item')", "Escape did not close project information and restore focus");
+      await waitForNative(() => browserView().getVisible(), "Native webpage did not return after the project card closed");
+      window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Right" });
+      window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Right" });
+      await waitFor("Boolean(document.querySelector('.project-info-popover'))", "Keyboard did not reopen project information");
+      await evaluate("document.querySelector('.project-info-edit').click()");
+      await waitFor("Boolean(document.querySelector('.current-project-dialog'))", "Project card did not open current-project editing");
+      assert.equal(await evaluate("document.querySelector('.current-project-dialog [aria-label=\"项目名称\"]').value"), "Upgrade smoke");
+      escapeModal();
+      await waitFor("!document.querySelector('.modal-backdrop')", "Project editing did not close");
+      await evaluate("if (document.querySelector('.work-panel').hidden) document.querySelector('.header-actions .header-button').click()");
+      await waitForNative(() => browserView().getVisible(), "Native webpage did not return after the project card closed");
+      window.webContents.sendInputEvent({ type: "mouseMove", x: 600, y: 100 });
+      console.log("[desktop-smoke] PASS: compact project rows, hover card, pointer crossing, saved pin, current-project editing and native browser layering");
       const browserBounds = await evaluate("(() => { const r = document.querySelector('.browser-surface').getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }; })()");
       assert.deepEqual(browserView().getBounds(), browserBounds);
       await evaluate("document.querySelector('[aria-label=\"展开工作面板\"]').click()");
@@ -225,14 +289,11 @@ app.once("browser-window-created", (_event, window) => {
       await evaluate("document.querySelector('[aria-label=\"网页后退\"]').click()");
       await waitFor("document.querySelector('.work-tab [aria-selected=true]')?.textContent === 'Browser first'", "Browser back did not restore the previous page");
       await evaluate("document.querySelector('[aria-label=\"关闭工作面板\"]').click()");
-      await delay(150);
-      assert.equal(browserView().getVisible(), false, "Collapsed browser covered the chat");
+      await waitForNative(() => !browserView().getVisible(), "Collapsed browser covered the chat");
       await evaluate("document.querySelector('.header-actions .header-button').click()");
-      await delay(150);
-      assert.equal(browserView().getVisible(), true);
+      await waitForNative(() => browserView().getVisible(), "Reopening the panel did not restore the native browser");
       await evaluate("document.querySelector('[aria-label=\"添加面板内容\"]').click()");
-      await delay(150);
-      assert.equal(browserView().getVisible(), false, "Native browser covered the operation menu");
+      await waitForNative(() => !browserView().getVisible(), "Native browser covered the operation menu");
       await evaluate("document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))");
       await evaluate("document.querySelector('[aria-label=\"关闭 Browser first\"]').click()");
       await waitFor("Boolean(document.querySelector('.work-empty-actions')) && document.querySelectorAll('.work-tab').length === 0", "Closing the last tab did not restore the empty chooser");
@@ -356,7 +417,8 @@ app.once("browser-window-created", (_event, window) => {
       console.log("[desktop-smoke] PASS: centralized system information, gear toggle, preserved chat draft and work-panel tabs");
       // Deliver deterministic streaming events through the real preload bridge.
       // These renderer-only fixtures never reach Pi's persisted transcript.
-      const streamEvent = (event) => window.webContents.send("agent:event", { sessionId: restored.sessionId, runId: "scroll-smoke", messageId: "scroll-message", ...event });
+      const streamTimestamp = Date.now() - 120_000;
+      const streamEvent = (event) => window.webContents.send("agent:event", { sessionId: restored.sessionId, runId: "scroll-smoke", messageId: "scroll-message", timestamp: streamTimestamp, ...event });
       streamEvent({ type: "run.started" });
       streamEvent({ type: "message.started" });
       streamEvent({ type: "reasoning.started", reasoningId: "scroll-reasoning" });
@@ -370,10 +432,22 @@ app.once("browser-window-created", (_event, window) => {
       await evaluate("document.querySelector('.reasoning-step-heading').click()");
       await waitFor("document.querySelector('.reasoning-output')?.textContent.includes('测试流式推理')", "Completed reasoning could not be reopened");
       await evaluate("document.querySelector('.reasoning-step-heading').click()");
-      streamEvent({ type: "message.delta", text: "```text\nKeep this code block mounted\n```\n\n" + "流式消息内容，用于检查滚动位置和末尾可见性。\n\n".repeat(65) });
+      const streamText = "```text\nKeep this code block mounted\n```\n\n" + "流式消息内容，用于检查滚动位置和末尾可见性。\n\n".repeat(65);
+      streamEvent({ type: "message.delta", text: streamText });
       const atBottom = "document.querySelector('.thread').scrollHeight - document.querySelector('.thread').clientHeight - document.querySelector('.thread').scrollTop < 2";
       await waitFor("document.querySelector('.thread').textContent.includes('Keep this code block mounted')", "Streaming content did not render");
       await waitFor(atBottom, "Streaming output did not follow the bottom");
+      app.focus({ steal: true });
+      window.focus();
+      window.webContents.focus();
+      await waitFor("document.hasFocus()", "Assistant copy test window did not receive focus");
+      await evaluate("[...document.querySelectorAll('.assistant-message .message-copy')].at(-1).click()", true);
+      await waitFor("[...document.querySelectorAll('.assistant-message .message-copy-status')].at(-1)?.textContent === '已复制'", "Assistant copy did not show success");
+      assert.equal(clipboard.readText(), streamText, "Message copy included metadata/reasoning or lost Markdown");
+      assert.equal(await evaluate("[...document.querySelectorAll('.assistant-message .message-meta time')].at(-1).dateTime"), new Date(streamTimestamp).toISOString(), "Streaming assistant time did not use its message timestamp");
+      await evaluate("Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('Denied'); } } }); [...document.querySelectorAll('.assistant-message .message-copy')].at(-1).click()");
+      await waitFor("[...document.querySelectorAll('.assistant-message .message-copy-status')].at(-1)?.textContent.includes('复制失败')", "Clipboard failure was not visible");
+      await evaluate("delete navigator.clipboard");
       assert.ok(await evaluate("document.querySelector('.thread').getBoundingClientRect().bottom <= document.querySelector('.composer-wrap').getBoundingClientRect().top + 1"), "Composer covered the conversation viewport");
       assert.ok(await evaluate("document.querySelector('.working-state').getBoundingClientRect().bottom <= document.querySelector('.composer-wrap').getBoundingClientRect().top"), "Last output was hidden behind the composer");
       await evaluate("window.__streamCode = document.querySelector('.thread .markdown-code-block'); document.querySelector('.thread').scrollTop = 50;");
@@ -513,6 +587,14 @@ app.once("browser-window-created", (_event, window) => {
         await evaluate("document.querySelector('.send-button:not(.stop-button)').click()");
       };
       await send("Background B first request");
+      await waitFor("Boolean(document.querySelector('.user-message .message-meta time'))", "User message did not show its send time");
+      app.focus({ steal: true });
+      window.focus();
+      window.webContents.focus();
+      await waitFor("document.hasFocus()", "Copy test window did not receive focus");
+      await evaluate("document.querySelector('.user-message .message-copy').focus({ preventScroll: true }); document.querySelector('.user-message .message-copy').click()", true);
+      await waitFor("document.querySelector('.user-message .message-copy-status')?.textContent === '已复制'", "User message copy did not show success");
+      assert.equal(clipboard.readText(), "Background B first request", "User message copy included its timestamp or controls");
       await waitFor("[...document.querySelectorAll('.project-session-item')].some(button => button.textContent.includes('Background B first request') && button.querySelector('.session-running-icon'))", "First-turn session was not indexed and marked running before completion");
       await waitFor("document.querySelector('.thread').textContent.includes('B is still working')", "Full access blocked tool execution");
       assert.match(await evaluate("document.querySelector('.working-state').textContent"), /Agentx 正在工作/);
@@ -631,6 +713,21 @@ app.once("browser-window-created", (_event, window) => {
       await queueMore();
       await waitFor("Boolean(document.querySelector('.input-queue-menu'))", "Queue more menu did not open");
       await waitForNative(() => !sessionBrowserView().getVisible(), "Native browser covered the queued input menu");
+      await evaluate("window.queueMenuScrolls = 0; document.querySelector('.thread').addEventListener('scroll', () => window.queueMenuScrolls++);");
+      for (let index = 0; index < 6; index++) {
+        heldResponses[2].stream(`\n\nStreaming menu stability ${index}.\n\n${"Output continues while the menu is open.\n\n".repeat(12)}`);
+        await waitFor(`document.querySelector('.thread').textContent.includes('Streaming menu stability ${index}.')`, "Streaming fixture did not update the conversation");
+        await delay(60);
+        assert.ok(await evaluate("Boolean(document.querySelector('.input-queue-menu')) && Boolean(document.activeElement?.closest('.input-queue-menu'))"), "Streaming scroll closed the queue menu or stole its focus");
+      }
+      assert.ok(await evaluate("window.queueMenuScrolls > 0"), "Menu regression did not exercise conversation auto-scrolling");
+      await evaluate("document.querySelector('.composer textarea').style.height = '160px'");
+      await waitFor("(() => { const menu = document.querySelector('.input-queue-menu')?.getBoundingClientRect(); const anchor = [...document.querySelectorAll('.input-queue-item')].find(element => element.textContent.includes('Queue later input')).querySelector('[aria-label=\"待处理消息更多操作\"]').getBoundingClientRect(); return menu && Math.abs(menu.bottom + 6 - anchor.top) < 2 && menu.left >= 0 && menu.right <= innerWidth; })()", "Menu did not follow its anchor after the composer resized");
+      await evaluate("document.querySelector('.composer textarea').style.removeProperty('height')");
+      escapeModal();
+      await waitFor("!document.querySelector('.input-queue-menu')", "Escape did not dismiss the queue menu after streaming");
+      await queueMore();
+      await waitFor("Boolean(document.querySelector('.input-queue-menu'))", "Queue menu did not reopen after streaming");
       await evaluate("[...document.querySelectorAll('.input-queue-menu button')].find(button => button.textContent.includes('查看完整内容')).click()");
       await waitFor("document.querySelector('.queued-input-detail')?.textContent.includes('Queue later input')", "Queue full message details were not readable");
       escapeModal();
@@ -645,10 +742,15 @@ app.once("browser-window-created", (_event, window) => {
       await delay(100);
       await writeFile(path.join(os.tmpdir(), "agentx-pending-inputs.png"), (await window.webContents.capturePage()).toPNG());
       await evaluate("(() => { const input = document.querySelector('.composer textarea'); Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, 'B unsent draft'); input.dispatchEvent(new Event('input', { bubbles: true })); })()");
+      await evaluate("(() => { const data = new DataTransfer(); const read = File.prototype.arrayBuffer; File.prototype.arrayBuffer = async function () { if (this.name === 'delayed-paste.txt') { File.prototype.arrayBuffer = read; await new Promise(resolve => setTimeout(resolve, 400)); } return read.call(this); }; data.items.add(new File(['source session only'], 'delayed-paste.txt', { type: 'text/plain' })); document.querySelector('.composer textarea').dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true })); })()");
       await invoke("projectCommand", { type: "open", projectId: created.project.id, sessionId: imported.sessionId });
       await waitFor("!document.querySelector('.input-queue') && document.querySelector('.composer textarea').value !== 'B unsent draft'", "Queue or draft leaked into session A");
+      await delay(500);
+      assert.equal(await evaluate("document.querySelectorAll('.composer .attachment-item').length"), 0, "An attachment finished reading into another session");
       await invoke("projectCommand", { type: "open", projectId: created.project.id, sessionId: sessionB.workspace.sessionId });
       await waitFor("document.querySelectorAll('.input-queue-item').length === 2 && document.querySelector('.composer textarea').value === 'B unsent draft'", "Switching sessions lost queued inputs or draft");
+      await waitFor("document.querySelector('.composer .attachment-list')?.textContent.includes('delayed-paste.txt')", "Switching sessions lost an attachment imported into the source draft");
+      await evaluate("document.querySelector('.composer .attachment-remove').click()");
       heldResponses[2]();
       await waitFor("!document.querySelector('.input-queue, .stop-button') && document.querySelector('.thread').textContent.includes('Follow-up finished.')", "Queued messages did not finish");
       assert.deepEqual(await evaluate("[...document.querySelectorAll('.user-message-text')].map(element => element.textContent).filter(text => text.startsWith('Queue '))"), ["Queue original input", "Queue steering input", "Queue later input"]);
@@ -666,6 +768,30 @@ app.once("browser-window-created", (_event, window) => {
       await evaluate("document.querySelector('[aria-label=\"继续发送待处理消息\"]').click()");
       await waitFor("!document.querySelector('.input-queue, .stop-button') && document.querySelector('.thread').textContent.includes('Resumed from UI.')", "Paused message did not resume");
       console.log("[desktop-smoke] PASS: editable running composer, reasoning folding, inline Steer/cancel, more/details/edit, native browser layering, queue order, scoped drafts, distinct exchanges, stop and explicit resume");
+      const liveTimes = await evaluate("[...document.querySelectorAll('.thread .message-meta time')].map(element => element.dateTime)");
+      const persisted = await invoke("command", { type: "getWorkspace", sessionId: sessionB.workspace.sessionId });
+      assert.deepEqual(liveTimes, persisted.messages.map(message => new Date(message.timestamp).toISOString()), "Live message times differ from Pi's persisted timestamps");
+      await invoke("restoreWorkspace");
+      await waitFor("!document.querySelector('.stop-button') && document.querySelector('.thread').textContent.includes('Resumed from UI.')", "Copy/time test failed to restore the session");
+      assert.deepEqual(await evaluate("[...document.querySelectorAll('.thread .message-meta time')].map(element => element.dateTime)"), liveTimes, "Session restore changed message timestamps");
+      assert.ok(await evaluate("[...document.querySelectorAll('.user-message')].every(message => message.querySelector('.message-meta').getBoundingClientRect().top >= message.querySelector('.user-message-bubble').getBoundingClientRect().bottom)"), "User metadata was placed inside the message bubble");
+      await evaluate("document.activeElement?.blur()");
+      await moveTo('.brand-name');
+      await waitFor("[...document.querySelectorAll('.message-meta')].every(element => getComputedStyle(element).opacity === '0')", "Message controls were visible before hover");
+      const hoverHeight = await evaluate("document.querySelector('.thread').scrollHeight");
+      await moveTo('.assistant-message:last-of-type .message-meta');
+      await waitFor("getComputedStyle(document.querySelector('.assistant-message:last-of-type .message-meta')).opacity === '1'", "Hovering the reply did not reveal its controls");
+      assert.equal(await evaluate("document.querySelector('.thread').scrollHeight"), hoverHeight, "Revealing message controls changed the conversation layout");
+      assert.match(await evaluate("document.querySelector('.assistant-message:last-of-type .message-meta time').textContent"), /^\d{2}:\d{2}$/);
+      app.focus({ steal: true });
+      window.focus();
+      window.webContents.focus();
+      await waitFor("document.hasFocus()", "Restored copy test window did not receive focus");
+      await evaluate("[...document.querySelectorAll('.assistant-message .message-copy')].at(-1).click()", true);
+      await waitFor("[...document.querySelectorAll('.assistant-message .message-copy-status')].at(-1)?.textContent === '已复制'", "Restored reply could not be copied");
+      assert.equal(clipboard.readText(), "Resumed from UI.");
+      await writeFile(path.join(os.tmpdir(), "agentx-message-copy-time.png"), (await window.webContents.capturePage()).toPNG());
+      console.log("[desktop-smoke] PASS: user/reply copy, raw Markdown, clipboard failure feedback, stable streaming and restored timestamps including queued inputs");
       exitCode = 0;
     } catch (error) {
       console.error("[desktop-smoke] FAIL:", error);

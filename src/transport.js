@@ -1,44 +1,14 @@
 import { DEFAULT_TOOL_IDS, TOOL_CATALOG } from "../electron/tool-registry.mjs";
-
-const browserImageExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
-const browserTextExtensions = new Set([
-  "txt", "md", "markdown", "json", "jsonl", "csv", "tsv", "yaml", "yml", "toml", "xml", "html", "htm",
-  "css", "scss", "less", "js", "jsx", "ts", "tsx", "mjs", "cjs", "py", "rb", "go", "rs", "java", "kt",
-  "kts", "swift", "c", "h", "cpp", "hpp", "cs", "php", "sh", "bash", "zsh", "fish", "ps1", "sql", "ini",
-  "conf", "properties", "log", "diff", "patch", "svg", "mermaid", "mmd",
-]);
+import { imageExtensions, textExtensions, readAttachmentFiles } from "./attachment-files.js";
 
 function chooseBrowserAttachments({ maxFiles = 8 } = {}) {
   return new Promise((resolve) => {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = true;
-    input.accept = [...browserImageExtensions, ...browserTextExtensions].map((extension) => `.${extension}`).join(",");
+    input.accept = [...imageExtensions.keys(), ...textExtensions].map((extension) => `.${extension}`).join(",");
     const finish = async () => {
-      const attachments = [];
-      const rejected = [];
-      const files = [...(input.files || [])];
-      for (const [index, file] of files.entries()) {
-        const extension = file.name.split(".").pop()?.toLowerCase() || "";
-        try {
-          if (index >= maxFiles) throw new Error("每条消息最多添加 8 个附件");
-          if (browserImageExtensions.has(extension)) {
-            if (file.size > 10 * 1024 * 1024) throw new Error("图片不能超过 10 MB");
-            const bytes = new Uint8Array(await file.arrayBuffer());
-            let binary = "";
-            for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-            attachments.push({ id: crypto.randomUUID(), kind: "image", name: file.name, mimeType: file.type || `image/${extension === "jpg" ? "jpeg" : extension}`, size: file.size, data: btoa(binary) });
-          } else if (browserTextExtensions.has(extension)) {
-            if (file.size > 1024 * 1024) throw new Error("文本文件不能超过 1 MB");
-            attachments.push({ id: crypto.randomUUID(), kind: "text", name: file.name, mimeType: file.type || "text/plain", size: file.size, content: await file.text() });
-          } else {
-            throw new Error("当前版本仅支持图片、纯文本和常见代码文件");
-          }
-        } catch (error) {
-          rejected.push({ name: file.name, message: error.message || "无法读取文件" });
-        }
-      }
-      resolve({ attachments, rejected });
+      resolve(await readAttachmentFiles(input.files || [], { maxFiles }));
     };
     input.addEventListener("change", finish, { once: true });
     input.addEventListener("cancel", () => resolve({ attachments: [], rejected: [] }), { once: true });

@@ -64,7 +64,7 @@ function pauseInputQueue(reason) {
   if (queuedInputs.size) publishInputQueue();
 }
 
-function consumeInput(entry) {
+function consumeInput(entry, timestamp) {
   if (!queuedInputs.delete(entry.id)) return;
   // A queued user input starts a distinct visible exchange, even though Pi can
   // process several exchanges inside one agent loop / prompt() promise.
@@ -79,7 +79,7 @@ function consumeInput(entry) {
   }
   initialQueuedInput = undefined;
   emit({ type: "input.consumed", sessionId: session.sessionId, runId: activeRunId,
-    input: { id: entry.id, text: entry.text, attachments: entry.attachments } });
+    input: { id: entry.id, text: entry.text, attachments: entry.attachments, timestamp } });
   publishInputQueue();
 }
 
@@ -224,6 +224,7 @@ function serializeMessages(messages) {
     assistant = {
       id: `history-assistant-${timestamp || index}`,
       role: "assistant",
+      timestamp: asTimestamp(messages[index].timestamp, null),
       text: "",
       activities: [],
       status: "done",
@@ -258,7 +259,7 @@ function serializeMessages(messages) {
         const image = imageContent[imageIndex];
         attachments.push({ id: `history-image-${index}-${imageIndex}`, kind: "image", name: `图片 ${imageIndex + 1}`, mimeType: image.mimeType, data: image.data });
       }
-      result.push({ id: `history-user-${message.timestamp || index}`, role: "user", text: parsed.text, attachments });
+      result.push({ id: `history-user-${message.timestamp || index}`, role: "user", text: parsed.text, attachments, timestamp: asTimestamp(message.timestamp, null) });
       return;
     }
     if (message.role === "assistant") {
@@ -582,7 +583,7 @@ function onSessionEvent(event) {
   if (event.type === "message_start" && event.message.role === "user") {
     const text = stringifyContent(event.message.content);
     const entry = initialQueuedInput || [...queuedInputs.values()].find((item) => item.status === "delivering" && item.sdkText === text);
-    if (entry) consumeInput(entry);
+    if (entry) consumeInput(entry, asTimestamp(event.message.timestamp));
   }
   if (event.type === "message_end" && event.message.role === "user") {
     // Public listeners run just before Pi appends the message. Wait for that
@@ -606,7 +607,7 @@ function onSessionEvent(event) {
     // A later attempt may recover from a retryable provider error.
     activeRunError = undefined;
     activeMessageId = `message-${event.message.timestamp || Date.now()}`;
-    emit({ type: "message.started", sessionId, runId: activeRunId, messageId: activeMessageId, startedAt: activeRunStartedAt || Date.now() });
+    emit({ type: "message.started", sessionId, runId: activeRunId, messageId: activeMessageId, startedAt: activeRunStartedAt || Date.now(), timestamp: asTimestamp(event.message.timestamp) });
     return;
   }
   if (event.type === "message_end" && event.message.role === "assistant") {

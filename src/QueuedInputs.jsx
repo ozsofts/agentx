@@ -1,28 +1,65 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ArrowBendDownRight, ArrowUp, DotsThree, FileText, ListChecks, PencilSimple, Trash, X } from "@phosphor-icons/react";
 import Modal from "./Modal.jsx";
 
 export default function QueuedInputs({ entries, running, hasDraft, onResume, onRemove, onBehavior }) {
   const [menu, setMenu] = useState(null);
+  const [position, setPosition] = useState({ top: 8, left: 8 });
   const [detail, setDetail] = useState(null);
   const [busy, setBusy] = useState(null);
   const popup = useRef(null);
   const trigger = useRef(null);
   const selected = entries.find((entry) => entry.id === menu?.id);
+  useLayoutEffect(() => {
+    if (!menu || !selected) return;
+    let frame;
+    const place = () => {
+      const anchor = trigger.current;
+      const panel = popup.current;
+      if (!anchor?.isConnected || !panel) return;
+      const rect = anchor.getBoundingClientRect();
+      const list = anchor.closest(".input-queue-list")?.getBoundingClientRect();
+      // Close only when the actual anchor scrolls out of view, never because
+      // streaming output scrolled the separate conversation above the composer.
+      if (rect.bottom <= Math.max(0, list?.top ?? 0) || rect.top >= Math.min(innerHeight, list?.bottom ?? innerHeight)) {
+        setMenu(null);
+        return;
+      }
+      const { width, height } = panel.getBoundingClientRect();
+      const top = rect.top - height - 6 >= 8 ? rect.top - height - 6 : rect.bottom + 6;
+      const next = {
+        top: Math.max(8, Math.min(top, innerHeight - height - 8)),
+        left: Math.max(8, Math.min(rect.right - width, innerWidth - width - 8)),
+      };
+      setPosition((current) => current.top === next.top && current.left === next.left ? current : next);
+    };
+    const schedule = (event) => {
+      if (event?.type === "scroll" && event.target instanceof Element && !event.target.contains(trigger.current)) return;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(place);
+    };
+    place();
+    const observer = new ResizeObserver(schedule);
+    observer.observe(popup.current);
+    observer.observe(trigger.current.closest(".composer-wrap"));
+    window.addEventListener("resize", schedule);
+    window.addEventListener("scroll", schedule, true);
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("scroll", schedule, true);
+    };
+  }, [menu?.id, Boolean(selected)]);
   useEffect(() => {
     if (!menu) return;
     if (!selected) { setMenu(null); return; }
-    popup.current?.querySelector('button:not(:disabled)')?.focus();
+    popup.current?.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
     const outside = (event) => { if (!popup.current?.contains(event.target) && !trigger.current?.contains(event.target)) setMenu(null); };
-    const close = (event) => { if (!popup.current?.contains(event.target)) setMenu(null); };
     document.addEventListener("pointerdown", outside);
-    window.addEventListener("resize", close);
-    window.addEventListener("scroll", close, true);
     return () => {
       document.removeEventListener("pointerdown", outside);
-      window.removeEventListener("resize", close);
-      window.removeEventListener("scroll", close, true);
     };
   }, [menu, Boolean(selected)]);
   const act = async (entry, operation) => {
@@ -55,14 +92,13 @@ export default function QueuedInputs({ entries, running, hasDraft, onResume, onR
             <button type="button" disabled={blocked} onClick={() => act(entry, () => onRemove(entry))} title="取消这条待处理消息" aria-label="移除待处理消息"><Trash size={16} /></button>
             <button type="button" aria-label="待处理消息更多操作" title="更多操作" aria-haspopup="menu" aria-expanded={menu?.id === entry.id} onClick={(event) => {
               trigger.current = event.currentTarget;
-              const rect = event.currentTarget.getBoundingClientRect();
-              setMenu(menu?.id === entry.id ? null : { id: entry.id, top: Math.max(8, rect.top - 146), right: Math.max(8, window.innerWidth - rect.right) });
+              setMenu(menu?.id === entry.id ? null : { id: entry.id });
             }}><DotsThree size={20} weight="bold" /></button>
           </div>
         </div>;
       })}</div>
     </section>}
-    {menu && selected && createPortal(<div ref={popup} className="input-queue-menu" role="menu" aria-label="待处理消息操作" style={{ top: menu.top, right: menu.right }} onKeyDown={menuKey}>
+    {menu && selected && createPortal(<div ref={popup} className="input-queue-menu" role="menu" aria-label="待处理消息操作" style={position} onKeyDown={menuKey}>
       <button type="button" role="menuitem" onClick={() => { setDetail(selected); setMenu(null); }}><FileText size={15} />查看完整内容</button>
       <button type="button" role="menuitem" disabled={hasDraft || selected.status === "delivering" || busy === selected.id} title={hasDraft ? "请先发送或清空输入框中的草稿" : "取消排队并移回输入框"} onClick={() => act(selected, () => onRemove(selected, true))}><PencilSimple size={15} />移回输入框编辑</button>
       {selected.behavior === "steer" && <button type="button" role="menuitem" disabled={selected.status === "delivering" || busy === selected.id} onClick={() => act(selected, () => onBehavior(selected, "followUp"))}><ListChecks size={15} />改为等待当前任务完成</button>}

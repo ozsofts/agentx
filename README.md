@@ -5,6 +5,7 @@ A Codex-inspired local desktop client for Pi Agent. The renderer consumes a stab
 ## Implemented Loop
 
 - Select and restore a local project directory
+- Keep project actions in the sidebar: project rows show only their name, with a hover/focus card for directory, session count, pinning and editing. Paste images or supported UTF-8 text/code files into the composer as pending attachments; ordinary pasted text stays in the draft.
 - Create or reopen Pi JSONL sessions
 - Use the conversation header menu to rename, inspect, export HTML/complete JSONL, import JSONL into a confirmed project, or archive a session. Imports receive independent IDs and preserve the source file; archives retain JSONL and can be restored in project information. Empty drafts are saved only after the first message, and disruptive actions are blocked while running.
 - Recover project metadata from `.pi/project.json` and reconcile it with Pi JSONL sessions

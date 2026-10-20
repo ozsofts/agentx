@@ -157,6 +157,13 @@ test("queued inputs steer at tool boundaries, follow up in order, and pause on s
   assert.equal(new Set(host.events.filter((event) => event.type === "message.started").map((event) => event.runId)).size, 4);
   assert.equal((await host.command({ type: "getWorkspace" })).pendingInputs.length, 0);
   assert.equal(completed.messages.filter((message) => message.role === "user").length, 4);
+  for (const [index, consumed] of host.events.filter((event) => event.type === "input.consumed").entries()) {
+    const saved = completed.messages.filter((message) => message.role === "user")[index + 1];
+    assert.equal(saved.timestamp, consumed.input.timestamp, "Queued input lost its consumption timestamp on restore");
+  }
+  for (const event of host.events.filter((event) => event.type === "message.started")) {
+    assert.ok(completed.messages.some((message) => message.role === "assistant" && message.timestamp === event.timestamp), "Assistant timestamp changed between streaming and history");
+  }
 
   replies.push({ hold: true });
   const stopped = host.command({ type: "prompt", text: "Task to stop" });
@@ -443,6 +450,8 @@ test("Pi upgrade preserves the real Host protocol, permissions, attachments and 
   const legacy = await initialize({ sessionFile: legacyFile });
   assert.equal(legacy.sessionId, "legacy-session");
   const oldReply = legacy.messages.find((message) => message.role === "assistant");
+  assert.equal(legacy.messages.find((message) => message.role === "user").timestamp, timestamp);
+  assert.equal(oldReply.timestamp, timestamp);
   assert.equal(oldReply.text, "Legacy reply");
   assert.ok(oldReply.activities.some((activity) => activity.output === "Legacy reasoning"));
   assert.ok(oldReply.activities.some((activity) => activity.output === "Legacy edit result" && activity.status === "done"));

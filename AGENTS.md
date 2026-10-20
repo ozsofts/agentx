@@ -14,6 +14,10 @@ When the sidebar is collapsed, show the Agentx logo in the header. Hovering or f
 
 When the project sidebar is collapsed to icons, hovering or focusing a project icon opens that project's session list to its right. Keep the list open while moving into it, allow scrolling and session selection without expanding the sidebar, and show the current and running sessions. Dismiss it on leaving, outside click or Escape; keep native webpage previews beneath this overlay.
 
+In the expanded sidebar, keep project rows to a single project name without a Session count. Hovering or focusing a row reveals a compact information card with name, active-session count, directory, pin toggle and edit-project action. Keep it reachable across the pointer gap and by keyboard, bound it to the viewport, ignore unrelated conversation scrolling, and hide native website views beneath it. Keep project selection and editing in the project/sidebar area; the composer must not contain a project-directory picker.
+
+Allow pasting clipboard image files and supported UTF-8 text/code files into the composer as pending attachments, while leaving plain-text paste as text. Apply the attachment type, content, count, per-file and total-size limits and the model image-capability check equally to paste and file selection. Read files only after the user pastes them; never submit automatically. Preserve the source Session draft if file reading finishes after switching Sessions, and prevent sending until attachment import finishes.
+
 On desktop widths, keep the sidebar management entry as an icon-only gear at the bottom right, alongside the Agent Host status. Preserve the existing mobile footer layout.
 
 The sidebar gear toggles management and the previous chat, preserving its draft, scroll position and work-panel tabs. Keep only the sidebar's compact connection indicator; put detailed runtime/transport/model/authentication/backend connection information in General > System information. Do not repeat status beneath the composer or in the management header.
@@ -24,11 +28,15 @@ Model settings offer explicit draft-configuration testing and live provider mode
 
 Keep rendered Markdown headings compact and proportional to the surrounding body text, with restrained weight and spacing rather than oversized document-style titles.
 
+Place a compact timestamp and copy icon outside the message bubble, below user and assistant messages. Order assistant controls as copy then time; user controls as time then copy. On devices with a mouse, reveal them only on message hover or keyboard focus, reserving layout space to avoid jumps; keep touch controls visible. Show today's local time as HH:mm, yesterday as 昨天 HH:mm, other dates this year as MM-DD HH:mm, and other years as YYYY-MM-DD HH:mm, with full date/time and timezone in a tooltip. Compare local calendar days and refresh labels at midnight and when returning to the app. Copy the message body with its Markdown intact, excluding timestamps, action labels and tool/reasoning records; report clipboard success or failure. Use the persisted Pi message timestamp, retain it on session restore, and show unknown time for history without a valid timestamp. Queued inputs acquire their chat timestamp when consumed, not when queued.
+
 Show each reasoning block expanded while it is streaming and prevent collapsing it or its containing process group during that block. Collapse the block when reasoning ends, independently of the rest of the task, and allow reopening it without removing any recorded content. Restored reasoning starts collapsed.
 
 Keep the composer editable while a Session runs. Default additional messages to follow-up queuing and offer explicit steering at Pi's next assistant/tool boundary; steering never cancels an in-flight model call or command. Show pending inputs separately until Pi consumes them, then append a distinct user/assistant exchange in consumption order. Scope queues and drafts by Session. Stop and model failure pause unconsumed inputs for explicit resend, editing or removal; do not auto-run them after an error. Pending queues are runtime state, not persisted chat messages, and must not be added to the transcript until consumed.
 
 Present pending inputs as compact single rows joined to the top of the composer: queue icon and truncated message at left, inline Steer, trash and ellipsis at right. Allow per-item cancellation and conversion between follow-up and steering during a run. The more menu offers full content and moving the message back to the composer for editing, without overwriting an existing draft. Prevent modifying an input once delivery to Pi has begun.
+
+Keep pending-input menus open during conversation scrolling and streaming output. Anchor them to their trigger, reposition on composer/viewport changes, and dismiss on outside click, Escape, or when their own row leaves view or is removed. Focusing the menu must not scroll the conversation.
 
 Keep the composer in normal layout flow so attachments and errors cannot cover the last messages. Stream output in small batches with stable Markdown renderer types. Follow new output only when the reader is near the bottom; preserve their position when reading earlier messages and offer a return-to-latest control. Avoid repeatedly restarting smooth scroll for tokens.
 
